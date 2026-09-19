@@ -1,0 +1,30 @@
+# Secrets and credentials
+**/serviceAccountKey.json
+serviceAccountKey.json
+**/.env
+.env
+*.pem
+*.key
+
+# Database backup dumps
+database_backup*.sql
+*.dump
+
+# Preserve schema and migration definitions
+!schema.sql
+!migrations/*.sql
+
+# Binaries and executables
+*.exe
+*.dll
+*.so
+
+# Uploads directory contents (user chat media)
+uploads/*
+!uploads/.gitkeep
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
