@@ -33,9 +33,10 @@ DROP TABLE IF EXISTS group_key_rotations CASCADE;
 CREATE TABLE IF NOT EXISTS profiles (
     firebase_uid TEXT PRIMARY KEY,
     username TEXT NOT NULL UNIQUE,
-    phone_hash TEXT NOT NULL UNIQUE,
+    phone_hash TEXT UNIQUE,
     profile_avatar_url TEXT,
     display_name VARCHAR(100),
+    avatar_privacy VARCHAR(20) NOT NULL DEFAULT 'everyone' CHECK (avatar_privacy IN ('everyone', 'contacts', 'nobody')),
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -280,6 +281,9 @@ CREATE TABLE IF NOT EXISTS group_invite_links (
 -- =============================================================================
 -- INDEXES FOR PERFORMANCE
 -- =============================================================================
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_username_lower ON profiles (LOWER(username));
+CREATE INDEX IF NOT EXISTS idx_profiles_phone_hash ON profiles (phone_hash) WHERE phone_hash IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at DESC);

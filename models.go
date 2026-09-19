@@ -26,13 +26,47 @@ type ConversationInfoResponse struct {
 
 // --- PAYLOAD STRUCTS FOR INCOMING REQUESTS ---
 
-// ProfilePayload is the data sent from Flutter after registration.
+// ProfilePayload is the data sent from client for profile creation.
 type ProfilePayload struct {
-    PhoneNumber string `json:"phoneNumber"`
-    PublicKey   string `json:"publicKey"`
-	EncryptedKeyShare  string `json:"encryptedKeyShare"`
+	Username          string `json:"username"`
+	DisplayName       string `json:"displayName,omitempty"`
+	PhoneNumber       string `json:"phoneNumber,omitempty"`
+	PublicKey         string `json:"publicKey,omitempty"`
+	EncryptedKeyShare string `json:"encryptedKeyShare,omitempty"`
+}
+
+// TrustedIdentity represents verified identity attributes derived from Firebase Admin SDK.
+type TrustedIdentity struct {
+	UID            string `json:"uid"`
+	PhoneNumber    string `json:"phoneNumber,omitempty"`
+	Email          string `json:"email,omitempty"`
+	EmailVerified  bool   `json:"emailVerified"`
+	Disabled       bool   `json:"disabled"`
+	SignInProvider string `json:"signInProvider"`
+}
+
+// APIErrorResponse standardizes all error payloads.
+type APIErrorResponse struct {
+	Error   string `json:"error"`
+	Message string `json:"message"`
+}
+
+// ProfileResponse represents the standard response for profile creation and retrieval.
+type ProfileResponse struct {
+	Status      string `json:"status"`
+	Message     string `json:"message,omitempty"`
+	UID         string `json:"uid"`
+	Username    string `json:"username"`
 	DisplayName string `json:"displayName,omitempty"`
-	Username    string `json:"username,omitempty"`  // ✅ Added for Google/Email users
+	AvatarURL     string `json:"avatarUrl,omitempty"`
+	AvatarPrivacy string `json:"avatarPrivacy,omitempty"`
+	PhoneNumber   string `json:"phoneNumber,omitempty"`
+	Email         string `json:"email,omitempty"`
+}
+
+// UpdatePrivacyPayload is the payload sent to update profile privacy settings.
+type UpdatePrivacyPayload struct {
+	AvatarPrivacy string `json:"avatarPrivacy"` // 'everyone', 'contacts', 'nobody'
 }
 
 // FriendRequestPayload is the data sent when requesting/accepting a friend.
