@@ -589,20 +589,22 @@ func sendMessageHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	// 1) Verify sender is a member of conversation
-	var isMember bool
+	// 1) Verify sender is a member of conversation and check announcement mode permissions
+	var userRole, sendMsgPerm sql.NullString
 	err = tx.QueryRow(`
-		SELECT EXISTS(
-		  SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND profile_uid = $2
-		)
-	`, req.ConversationID, senderUID).Scan(&isMember)
+		SELECT cm.role, COALESCE(c.send_messages_permission, 'all_members')
+		FROM conversation_members cm
+		JOIN conversations c ON cm.conversation_id = c.id
+		WHERE cm.conversation_id = $1 AND cm.profile_uid = $2
+	`, req.ConversationID, senderUID).Scan(&userRole, &sendMsgPerm)
 	if err != nil {
 		log.Printf("sendMessageHandler: check membership error: %v", err)
-		http.Error(w, "db error", http.StatusInternalServerError)
+		http.Error(w, "not a member of conversation", http.StatusForbidden)
 		return
 	}
-	if !isMember {
-		http.Error(w, "not a member of conversation", http.StatusForbidden)
+	if sendMsgPerm.Valid && sendMsgPerm.String == "only_admins" && userRole.Valid && userRole.String != "owner" && userRole.String != "admin" {
+		log.Printf("sendMessageHandler: rejected message from non-admin %s in announcement-only group %d", senderUID, req.ConversationID)
+		http.Error(w, "only admins can send messages to this group", http.StatusForbidden)
 		return
 	}
 	// 2) Insert message

@@ -2223,8 +2223,12 @@ func deleteGroupHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !creatorUID.Valid || creatorUID.String != currentUserUID {
-		http.Error(w, "Forbidden: Only the group creator can delete the group", http.StatusForbidden)
+	var userRole string
+	_ = db.QueryRow("SELECT role FROM conversation_members WHERE conversation_id = $1 AND profile_uid = $2", conversationID, currentUserUID).Scan(&userRole)
+
+	isOwner := userRole == "owner" || (creatorUID.Valid && creatorUID.String == currentUserUID)
+	if !isOwner {
+		http.Error(w, "Forbidden: Only the group owner can delete the group", http.StatusForbidden)
 		return
 	}
 
@@ -2297,6 +2301,8 @@ func deleteGroupHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	_, _ = tx.Exec("DELETE FROM group_join_requests WHERE conversation_id = $1", conversationID)
+
 	_, err = tx.Exec("DELETE FROM conversation_members WHERE conversation_id = $1", conversationID)
 	if err != nil {
 		log.Printf("DB error deleting members for group %d: %v", conversationID, err)
@@ -2367,8 +2373,11 @@ func getGroupInfoHandler(w http.ResponseWriter, r *http.Request) {
 	// Get group details
 	var response GroupInfoResponse
 	var description, avatarURL sql.NullString
+	var editPerm, sendPerm, addPerm sql.NullString
+	var reqApproval sql.NullBool
 	err = db.QueryRow(`
-		SELECT id, group_name, description, creator_uid, group_avatar_url, created_at, updated_at
+		SELECT id, group_name, description, creator_uid, group_avatar_url, created_at, updated_at,
+		       edit_group_info_permission, send_messages_permission, add_members_permission, require_admin_approval
 		FROM conversations
 		WHERE id = $1 AND is_group = true
 	`, groupID).Scan(
@@ -2379,6 +2388,10 @@ func getGroupInfoHandler(w http.ResponseWriter, r *http.Request) {
 		&avatarURL,
 		&response.CreatedAt,
 		&response.UpdatedAt,
+		&editPerm,
+		&sendPerm,
+		&addPerm,
+		&reqApproval,
 	)
 
 	if err != nil {
@@ -2396,6 +2409,23 @@ func getGroupInfoHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if avatarURL.Valid {
 		response.AvatarURL = avatarURL.String
+	}
+
+	response.EditGroupInfoPermission = "all_members"
+	if editPerm.Valid && editPerm.String != "" {
+		response.EditGroupInfoPermission = editPerm.String
+	}
+	response.SendMessagesPermission = "all_members"
+	if sendPerm.Valid && sendPerm.String != "" {
+		response.SendMessagesPermission = sendPerm.String
+	}
+	response.AddMembersPermission = "all_members"
+	if addPerm.Valid && addPerm.String != "" {
+		response.AddMembersPermission = addPerm.String
+	}
+	response.RequireAdminApproval = false
+	if reqApproval.Valid {
+		response.RequireAdminApproval = reqApproval.Bool
 	}
 
 	// Get group members with their roles
@@ -2458,20 +2488,25 @@ func addGroupMembersHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if current user is owner or admin
+	// Check if current user is member and check group permissions
 	var userRole string
+	var addPerm sql.NullString
+	var reqApproval sql.NullBool
 	err = db.QueryRow(`
-		SELECT role FROM conversation_members
-		WHERE conversation_id = $1 AND profile_uid = $2
-	`, groupID, currentUserUID).Scan(&userRole)
+		SELECT cm.role, c.add_members_permission, c.require_admin_approval
+		FROM conversation_members cm
+		JOIN conversations c ON cm.conversation_id = c.id
+		WHERE cm.conversation_id = $1 AND cm.profile_uid = $2
+	`, groupID, currentUserUID).Scan(&userRole, &addPerm, &reqApproval)
 
 	if err != nil {
 		http.Error(w, "Not a member of this group", http.StatusForbidden)
 		return
 	}
 
-	if userRole != "owner" && userRole != "admin" {
-		http.Error(w, "Only owners and admins can add members", http.StatusForbidden)
+	isAdminOrOwner := userRole == "owner" || userRole == "admin"
+	if addPerm.Valid && addPerm.String == "only_admins" && !isAdminOrOwner {
+		http.Error(w, "Only admins can add members to this group", http.StatusForbidden)
 		return
 	}
 
@@ -2574,7 +2609,59 @@ func addGroupMembersHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Add members to group
+	// If admin approval is required and requester is not an admin, enqueue requests
+	if reqApproval.Valid && reqApproval.Bool && !isAdminOrOwner {
+		for _, uid := range memberUIDs {
+			_, err = tx.Exec(`
+				INSERT INTO group_join_requests (conversation_id, profile_uid, requested_by_uid, status, created_at)
+				VALUES ($1, $2, $3, 'pending', NOW())
+				ON CONFLICT (conversation_id, profile_uid) DO UPDATE
+				SET status = 'pending', requested_by_uid = $3, created_at = NOW()
+			`, groupID, uid, currentUserUID)
+			if err != nil {
+				log.Printf("Failed to create join request for %s: %v", uid, err)
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			http.Error(w, "Failed to submit membership requests", http.StatusInternalServerError)
+			return
+		}
+
+		// Notify admins of new pending requests
+		adminRows, err := db.Query(`
+			SELECT profile_uid FROM conversation_members
+			WHERE conversation_id = $1 AND (role = 'owner' OR role = 'admin')
+		`, groupID)
+		if err == nil {
+			var adminUIDs []string
+			for adminRows.Next() {
+				var aUID string
+				if err := adminRows.Scan(&aUID); err == nil {
+					adminUIDs = append(adminUIDs, aUID)
+				}
+			}
+			adminRows.Close()
+			if len(adminUIDs) > 0 {
+				notificationPayload := map[string]interface{}{
+					"type":            "group_join_requests_updated",
+					"conversation_id": groupID,
+				}
+				notificationBytes, _ := json.Marshal(notificationPayload)
+				hub.broadcast <- HubMessage{message: notificationBytes, recipients: adminUIDs}
+			}
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"message":           "Membership request submitted for admin approval",
+			"pending_count":     len(memberUIDs),
+			"requires_approval": true,
+		})
+		return
+	}
+
+	// Direct addition (if no approval required or requester is admin/owner)
 	for _, uid := range memberUIDs {
 		_, err = tx.Exec(`
 			INSERT INTO conversation_members (conversation_id, profile_uid, role, joined_at)
@@ -2765,8 +2852,8 @@ func changeGroupMemberRoleHandler(hub *Hub, w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if userRole != "owner" {
-		http.Error(w, "Only the group owner can change member roles", http.StatusForbidden)
+	if userRole != "owner" && userRole != "admin" {
+		http.Error(w, "Only the group owner and admins can change member roles", http.StatusForbidden)
 		return
 	}
 
@@ -2797,6 +2884,12 @@ func changeGroupMemberRoleHandler(hub *Hub, w http.ResponseWriter, r *http.Reque
 	// Cannot change owner's role
 	if currentRole == "owner" {
 		http.Error(w, "Cannot change the owner's role", http.StatusForbidden)
+		return
+	}
+
+	// Only owner can demote an admin to member
+	if currentRole == "admin" && payload.NewRole == "member" && userRole != "owner" {
+		http.Error(w, "Only the group owner can dismiss other admins", http.StatusForbidden)
 		return
 	}
 
@@ -2863,20 +2956,24 @@ func updateGroupAvatarHandler(hub *Hub, w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Check if current user is owner
+	// Check if current user is member and check edit permission
 	var userRole string
+	var editPerm sql.NullString
 	err = db.QueryRow(`
-		SELECT role FROM conversation_members
-		WHERE conversation_id = $1 AND profile_uid = $2
-	`, groupID, currentUserUID).Scan(&userRole)
+		SELECT cm.role, c.edit_group_info_permission
+		FROM conversation_members cm
+		JOIN conversations c ON cm.conversation_id = c.id
+		WHERE cm.conversation_id = $1 AND cm.profile_uid = $2
+	`, groupID, currentUserUID).Scan(&userRole, &editPerm)
 
 	if err != nil {
 		http.Error(w, "Not a member of this group", http.StatusForbidden)
 		return
 	}
 
-	if userRole != "owner" {
-		http.Error(w, "Only the group owner can change the group avatar", http.StatusForbidden)
+	isAdminOrOwner := userRole == "owner" || userRole == "admin"
+	if editPerm.Valid && editPerm.String == "only_admins" && !isAdminOrOwner {
+		http.Error(w, "Only admins can change the group avatar", http.StatusForbidden)
 		return
 	}
 
@@ -2941,20 +3038,24 @@ func updateGroupInfoHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if current user is owner or admin
+	// Check if current user is member and check edit permission
 	var userRole string
+	var editPerm sql.NullString
 	err = db.QueryRow(`
-		SELECT role FROM conversation_members
-		WHERE conversation_id = $1 AND profile_uid = $2
-	`, groupID, currentUserUID).Scan(&userRole)
+		SELECT cm.role, c.edit_group_info_permission
+		FROM conversation_members cm
+		JOIN conversations c ON cm.conversation_id = c.id
+		WHERE cm.conversation_id = $1 AND cm.profile_uid = $2
+	`, groupID, currentUserUID).Scan(&userRole, &editPerm)
 
 	if err != nil {
 		http.Error(w, "Not a member of this group", http.StatusForbidden)
 		return
 	}
 
-	if userRole != "owner" && userRole != "admin" {
-		http.Error(w, "Only owner and admins can edit group info", http.StatusForbidden)
+	isAdminOrOwner := userRole == "owner" || userRole == "admin"
+	if editPerm.Valid && editPerm.String == "only_admins" && !isAdminOrOwner {
+		http.Error(w, "Only admins can edit group info", http.StatusForbidden)
 		return
 	}
 
@@ -3016,6 +3117,604 @@ func updateGroupInfoHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{
 		"message": "Group info updated successfully",
+	})
+}
+
+// initGroupPermissionsSchema ensures database tables and columns for group permissions exist
+func initGroupPermissionsSchema(db *sql.DB) {
+	queries := []string{
+		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS edit_group_info_permission VARCHAR(20) DEFAULT 'all_members'`,
+		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS send_messages_permission VARCHAR(20) DEFAULT 'all_members'`,
+		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS add_members_permission VARCHAR(20) DEFAULT 'all_members'`,
+		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS require_admin_approval BOOLEAN DEFAULT false`,
+		`CREATE TABLE IF NOT EXISTS group_join_requests (
+			id SERIAL PRIMARY KEY,
+			conversation_id INT REFERENCES conversations(id) ON DELETE CASCADE,
+			profile_uid VARCHAR(128) REFERENCES profiles(firebase_uid) ON DELETE CASCADE,
+			requested_by_uid VARCHAR(128) REFERENCES profiles(firebase_uid) ON DELETE CASCADE,
+			status VARCHAR(20) DEFAULT 'pending',
+			created_at TIMESTAMP DEFAULT NOW(),
+			reviewed_by_uid VARCHAR(128),
+			reviewed_at TIMESTAMP,
+			UNIQUE(conversation_id, profile_uid)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_group_join_requests_conv ON group_join_requests(conversation_id, status)`,
+	}
+	for _, q := range queries {
+		if _, err := db.Exec(q); err != nil {
+			log.Printf("Notice: initGroupPermissionsSchema query execution: %v", err)
+		}
+	}
+	log.Println("Group permissions schema verified")
+}
+
+func getGroupPermissionsHandler(w http.ResponseWriter, r *http.Request) {
+	token, _, err := getVerifiedToken(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	currentUserUID := token.UID
+
+	vars := mux.Vars(r)
+	groupID, err := strconv.Atoi(vars["groupId"])
+	if err != nil {
+		http.Error(w, "Invalid group ID", http.StatusBadRequest)
+		return
+	}
+
+	var isMember bool
+	err = db.QueryRow(`
+		SELECT EXISTS(SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND profile_uid = $2)
+	`, groupID, currentUserUID).Scan(&isMember)
+	if err != nil || !isMember {
+		http.Error(w, "Not a member of this group", http.StatusForbidden)
+		return
+	}
+
+	var resp GroupPermissionsResponse
+	var editPerm, sendPerm, addPerm sql.NullString
+	var reqApproval sql.NullBool
+	err = db.QueryRow(`
+		SELECT
+			COALESCE(edit_group_info_permission, 'all_members'),
+			COALESCE(send_messages_permission, 'all_members'),
+			COALESCE(add_members_permission, 'all_members'),
+			COALESCE(require_admin_approval, false)
+		FROM conversations
+		WHERE id = $1 AND is_group = true
+	`, groupID).Scan(
+		&editPerm,
+		&sendPerm,
+		&addPerm,
+		&reqApproval,
+	)
+	if err != nil {
+		http.Error(w, "Failed to fetch permissions", http.StatusInternalServerError)
+		return
+	}
+
+	resp.EditGroupInfoPermission = "all_members"
+	if editPerm.Valid && editPerm.String != "" {
+		resp.EditGroupInfoPermission = editPerm.String
+	}
+	resp.SendMessagesPermission = "all_members"
+	if sendPerm.Valid && sendPerm.String != "" {
+		resp.SendMessagesPermission = sendPerm.String
+	}
+	resp.AddMembersPermission = "all_members"
+	if addPerm.Valid && addPerm.String != "" {
+		resp.AddMembersPermission = addPerm.String
+	}
+	resp.RequireAdminApproval = false
+	if reqApproval.Valid {
+		resp.RequireAdminApproval = reqApproval.Bool
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func updateGroupPermissionsHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	token, _, err := getVerifiedToken(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	currentUserUID := token.UID
+
+	vars := mux.Vars(r)
+	groupID, err := strconv.Atoi(vars["groupId"])
+	if err != nil {
+		http.Error(w, "Invalid group ID", http.StatusBadRequest)
+		return
+	}
+
+	var userRole string
+	err = db.QueryRow(`
+		SELECT role FROM conversation_members
+		WHERE conversation_id = $1 AND profile_uid = $2
+	`, groupID, currentUserUID).Scan(&userRole)
+	if err != nil || (userRole != "owner" && userRole != "admin") {
+		http.Error(w, "Only owner and admins can update group permissions", http.StatusForbidden)
+		return
+	}
+
+	var payload UpdateGroupPermissionsPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	var updates []string
+	var args []interface{}
+	argCount := 1
+
+	if payload.EditGroupInfoPermission != nil {
+		val := *payload.EditGroupInfoPermission
+		if val == "all_members" || val == "only_admins" {
+			updates = append(updates, fmt.Sprintf("edit_group_info_permission = $%d", argCount))
+			args = append(args, val)
+			argCount++
+		}
+	}
+	if payload.SendMessagesPermission != nil {
+		val := *payload.SendMessagesPermission
+		if val == "all_members" || val == "only_admins" {
+			updates = append(updates, fmt.Sprintf("send_messages_permission = $%d", argCount))
+			args = append(args, val)
+			argCount++
+		}
+	}
+	if payload.AddMembersPermission != nil {
+		val := *payload.AddMembersPermission
+		if val == "all_members" || val == "only_admins" {
+			updates = append(updates, fmt.Sprintf("add_members_permission = $%d", argCount))
+			args = append(args, val)
+			argCount++
+		}
+	}
+	if payload.RequireAdminApproval != nil {
+		if !*payload.RequireAdminApproval {
+			var pendingCount int
+			err = db.QueryRow("SELECT COUNT(*) FROM group_join_requests WHERE conversation_id = $1 AND status = 'pending'", groupID).Scan(&pendingCount)
+			if err == nil && pendingCount > 0 {
+				http.Error(w, "Cannot disable admin approval while there are pending join requests. Please approve or deny all pending requests first.", http.StatusBadRequest)
+				return
+			}
+		}
+		updates = append(updates, fmt.Sprintf("require_admin_approval = $%d", argCount))
+		args = append(args, *payload.RequireAdminApproval)
+		argCount++
+	}
+
+	if len(updates) > 0 {
+		args = append(args, groupID)
+		query := fmt.Sprintf("UPDATE conversations SET %s, updated_at = NOW() WHERE id = $%d AND is_group = true",
+			strings.Join(updates, ", "), argCount)
+		if _, err := db.Exec(query, args...); err != nil {
+			log.Printf("Error updating group permissions: %v", err)
+			http.Error(w, "Failed to update permissions", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Broadcast permissions update to all group members
+	allMemberUIDs, err := getConversationMemberUIDs(db, groupID)
+	if err == nil {
+		notifPayload := map[string]interface{}{
+			"type":            "group_permissions_updated",
+			"conversation_id": groupID,
+		}
+		notifBytes, _ := json.Marshal(notifPayload)
+		hub.broadcast <- HubMessage{message: notifBytes, recipients: allMemberUIDs}
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Permissions updated successfully"})
+}
+
+func getGroupJoinRequestsHandler(w http.ResponseWriter, r *http.Request) {
+	token, _, err := getVerifiedToken(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	currentUserUID := token.UID
+
+	vars := mux.Vars(r)
+	groupID, err := strconv.Atoi(vars["groupId"])
+	if err != nil {
+		http.Error(w, "Invalid group ID", http.StatusBadRequest)
+		return
+	}
+
+	var userRole string
+	err = db.QueryRow(`
+		SELECT role FROM conversation_members
+		WHERE conversation_id = $1 AND profile_uid = $2
+	`, groupID, currentUserUID).Scan(&userRole)
+	if err != nil || (userRole != "owner" && userRole != "admin") {
+		http.Error(w, "Only owner and admins can view join requests", http.StatusForbidden)
+		return
+	}
+
+	rows, err := db.Query(`
+		SELECT jr.id, jr.conversation_id, jr.profile_uid, p.username, p.display_name, p.profile_avatar_url,
+		       COALESCE(p_req.username, jr.requested_by_uid), jr.status, jr.created_at
+		FROM group_join_requests jr
+		JOIN profiles p ON jr.profile_uid = p.firebase_uid
+		LEFT JOIN profiles p_req ON jr.requested_by_uid = p_req.firebase_uid
+		WHERE jr.conversation_id = $1 AND jr.status = 'pending'
+		ORDER BY jr.created_at ASC
+	`, groupID)
+	if err != nil {
+		log.Printf("Error fetching join requests: %v", err)
+		http.Error(w, "Failed to fetch join requests", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	requests := make([]GroupJoinRequestInfo, 0)
+	for rows.Next() {
+		var req GroupJoinRequestInfo
+		var displayName sql.NullString
+		var avatarURL sql.NullString
+		if err := rows.Scan(&req.ID, &req.GroupID, &req.ProfileUID, &req.Username, &displayName, &avatarURL, &req.RequestedBy, &req.Status, &req.CreatedAt); err != nil {
+			continue
+		}
+		if displayName.Valid {
+			req.DisplayName = displayName.String
+		}
+		if avatarURL.Valid {
+			req.AvatarURL = &avatarURL.String
+		}
+		requests = append(requests, req)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(requests)
+}
+
+func reviewGroupJoinRequestHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	token, _, err := getVerifiedToken(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	currentUserUID := token.UID
+
+	vars := mux.Vars(r)
+	groupID, err := strconv.Atoi(vars["groupId"])
+	requestID, err2 := strconv.Atoi(vars["requestId"])
+	if err != nil || err2 != nil {
+		http.Error(w, "Invalid parameters", http.StatusBadRequest)
+		return
+	}
+
+	var userRole string
+	err = db.QueryRow(`
+		SELECT role FROM conversation_members
+		WHERE conversation_id = $1 AND profile_uid = $2
+	`, groupID, currentUserUID).Scan(&userRole)
+	if err != nil || (userRole != "owner" && userRole != "admin") {
+		http.Error(w, "Only owner and admins can review join requests", http.StatusForbidden)
+		return
+	}
+
+	var payload ReviewJoinRequestPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if payload.Action != "approve" && payload.Action != "reject" {
+		http.Error(w, "Action must be 'approve' or 'reject'", http.StatusBadRequest)
+		return
+	}
+
+	var candidateUID string
+	err = db.QueryRow(`
+		SELECT profile_uid FROM group_join_requests
+		WHERE id = $1 AND conversation_id = $2 AND status = 'pending'
+	`, requestID, groupID).Scan(&candidateUID)
+	if err != nil {
+		http.Error(w, "Join request not found or already processed", http.StatusNotFound)
+		return
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, "Transaction start failed", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	if payload.Action == "approve" {
+		_, err = tx.Exec(`
+			INSERT INTO conversation_members (conversation_id, profile_uid, role, joined_at)
+			VALUES ($1, $2, 'member', NOW())
+			ON CONFLICT (conversation_id, profile_uid) DO NOTHING
+		`, groupID, candidateUID)
+		if err != nil {
+			log.Printf("Failed to insert approved member: %v", err)
+			http.Error(w, "Failed to add member", http.StatusInternalServerError)
+			return
+		}
+		_, err = tx.Exec(`
+			UPDATE group_join_requests
+			SET status = 'approved', reviewed_by_uid = $1, reviewed_at = NOW()
+			WHERE id = $2
+		`, currentUserUID, requestID)
+	} else {
+		_, err = tx.Exec(`
+			UPDATE group_join_requests
+			SET status = 'rejected', reviewed_by_uid = $1, reviewed_at = NOW()
+			WHERE id = $2
+		`, currentUserUID, requestID)
+	}
+
+	if err != nil {
+		http.Error(w, "Failed to update request status", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "Commit failed", http.StatusInternalServerError)
+		return
+	}
+
+	if payload.Action == "approve" {
+		_ = triggerKeyRotation(db, groupID, "member_added", currentUserUID, &candidateUID)
+		allMemberUIDs, err := getConversationMemberUIDs(db, groupID)
+		if err == nil {
+			notifPayload := map[string]interface{}{
+				"type":                  "conversation_update",
+				"conversation_id":       groupID,
+				"key_rotation_required": true,
+				"reason":                "member_added",
+			}
+			notifBytes, _ := json.Marshal(notifPayload)
+			hub.broadcast <- HubMessage{message: notifBytes, recipients: allMemberUIDs}
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": fmt.Sprintf("Join request %sd", payload.Action),
+	})
+}
+
+func batchReviewGroupJoinRequestsHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	token, _, err := getVerifiedToken(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	currentUserUID := token.UID
+
+	vars := mux.Vars(r)
+	groupID, err := strconv.Atoi(vars["groupId"])
+	if err != nil {
+		http.Error(w, "Invalid parameters", http.StatusBadRequest)
+		return
+	}
+
+	var userRole string
+	err = db.QueryRow(`
+		SELECT role FROM conversation_members
+		WHERE conversation_id = $1 AND profile_uid = $2
+	`, groupID, currentUserUID).Scan(&userRole)
+	if err != nil || (userRole != "owner" && userRole != "admin") {
+		http.Error(w, "Only owner and admins can review join requests", http.StatusForbidden)
+		return
+	}
+
+	var payload BatchReviewJoinRequestsPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if payload.Action != "approve_all" && payload.Action != "reject_all" {
+		http.Error(w, "Action must be 'approve_all' or 'reject_all'", http.StatusBadRequest)
+		return
+	}
+
+	// Fetch all pending candidate UIDs
+	rows, err := db.Query(`
+		SELECT profile_uid FROM group_join_requests
+		WHERE conversation_id = $1 AND status = 'pending'
+	`, groupID)
+	if err != nil {
+		http.Error(w, "Failed to query pending requests", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var candidateUIDs []string
+	for rows.Next() {
+		var uid string
+		if err := rows.Scan(&uid); err == nil {
+			candidateUIDs = append(candidateUIDs, uid)
+		}
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, "Transaction start failed", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	if payload.Action == "approve_all" {
+		for _, uid := range candidateUIDs {
+			_, _ = tx.Exec(`
+				INSERT INTO conversation_members (conversation_id, profile_uid, role, joined_at)
+				VALUES ($1, $2, 'member', NOW())
+				ON CONFLICT (conversation_id, profile_uid) DO NOTHING
+			`, groupID, uid)
+		}
+		_, err = tx.Exec(`
+			UPDATE group_join_requests
+			SET status = 'approved', reviewed_by_uid = $1, reviewed_at = NOW()
+			WHERE conversation_id = $2 AND status = 'pending'
+		`, currentUserUID, groupID)
+	} else {
+		_, err = tx.Exec(`
+			UPDATE group_join_requests
+			SET status = 'rejected', reviewed_by_uid = $1, reviewed_at = NOW()
+			WHERE conversation_id = $2 AND status = 'pending'
+		`, currentUserUID, groupID)
+	}
+
+	if err != nil {
+		http.Error(w, "Failed to update requests status", http.StatusInternalServerError)
+		return
+	}
+
+	// If disableApproval is requested, also update require_admin_approval to false
+	if payload.DisableApproval {
+		_, err = tx.Exec(`
+			UPDATE conversations
+			SET require_admin_approval = false, updated_at = NOW()
+			WHERE id = $1 AND is_group = true
+		`, groupID)
+		if err != nil {
+			http.Error(w, "Failed to disable admin approval", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "Commit failed", http.StatusInternalServerError)
+		return
+	}
+
+	// Broadcast updates
+	allMemberUIDs, err := getConversationMemberUIDs(db, groupID)
+	if err == nil {
+		if payload.Action == "approve_all" {
+			for _, uid := range candidateUIDs {
+				_ = triggerKeyRotation(db, groupID, "member_added", currentUserUID, &uid)
+			}
+			notifPayload := map[string]interface{}{
+				"type":                  "conversation_update",
+				"conversation_id":       groupID,
+				"key_rotation_required": true,
+				"reason":                "member_added",
+			}
+			notifBytes, _ := json.Marshal(notifPayload)
+			hub.broadcast <- HubMessage{message: notifBytes, recipients: allMemberUIDs}
+		}
+
+		if payload.DisableApproval {
+			permPayload := map[string]interface{}{
+				"type":            "group_permissions_updated",
+				"conversation_id": groupID,
+			}
+			permBytes, _ := json.Marshal(permPayload)
+			hub.broadcast <- HubMessage{message: permBytes, recipients: allMemberUIDs}
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message": fmt.Sprintf("All requests %sd successfully", payload.Action),
+		"count":   len(candidateUIDs),
+	})
+}
+
+func transferGroupOwnershipHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	token, _, err := getVerifiedToken(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	currentUserUID := token.UID
+
+	vars := mux.Vars(r)
+	groupID, err := strconv.Atoi(vars["groupId"])
+	if err != nil {
+		http.Error(w, "Invalid group ID", http.StatusBadRequest)
+		return
+	}
+
+	var userRole string
+	err = db.QueryRow(`
+		SELECT role FROM conversation_members
+		WHERE conversation_id = $1 AND profile_uid = $2
+	`, groupID, currentUserUID).Scan(&userRole)
+	if err != nil || userRole != "owner" {
+		http.Error(w, "Only the current group owner can transfer ownership", http.StatusForbidden)
+		return
+	}
+
+	var payload TransferOwnershipPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if payload.NewOwnerUID == "" || payload.NewOwnerUID == currentUserUID {
+		http.Error(w, "Invalid new owner UID", http.StatusBadRequest)
+		return
+	}
+
+	var targetExists bool
+	err = db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND profile_uid = $2
+		)
+	`, groupID, payload.NewOwnerUID).Scan(&targetExists)
+	if err != nil || !targetExists {
+		http.Error(w, "Target user is not a member of this group", http.StatusBadRequest)
+		return
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, "Failed to begin transaction", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`UPDATE conversations SET creator_uid = $1, updated_at = NOW() WHERE id = $2`, payload.NewOwnerUID, groupID)
+	if err != nil {
+		http.Error(w, "Failed to update group creator", http.StatusInternalServerError)
+		return
+	}
+
+	_, err = tx.Exec(`UPDATE conversation_members SET role = 'admin' WHERE conversation_id = $1 AND profile_uid = $2`, groupID, currentUserUID)
+	if err != nil {
+		http.Error(w, "Failed to update previous owner role", http.StatusInternalServerError)
+		return
+	}
+
+	_, err = tx.Exec(`UPDATE conversation_members SET role = 'owner' WHERE conversation_id = $1 AND profile_uid = $2`, groupID, payload.NewOwnerUID)
+	if err != nil {
+		http.Error(w, "Failed to update new owner role", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "Failed to commit ownership transfer", http.StatusInternalServerError)
+		return
+	}
+
+	allMemberUIDs, err := getConversationMemberUIDs(db, groupID)
+	if err == nil {
+		notifPayload := map[string]interface{}{
+			"type":            "conversation_update",
+			"conversation_id": groupID,
+		}
+		notifBytes, _ := json.Marshal(notifPayload)
+		hub.broadcast <- HubMessage{message: notifBytes, recipients: allMemberUIDs}
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "Ownership transferred successfully",
 	})
 }
 
@@ -3094,6 +3793,26 @@ func leaveGroupHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			http.Error(w, "Failed to delete empty group", http.StatusInternalServerError)
 			return
+		}
+	} else if creatorUID.Valid && creatorUID.String == currentUserUID {
+		// Group creator/owner left! Automatically elect oldest admin or oldest member as new owner
+		var successorUID string
+		err = tx.QueryRow(`
+			SELECT profile_uid FROM conversation_members
+			WHERE conversation_id = $1 AND role = 'admin'
+			ORDER BY joined_at ASC LIMIT 1
+		`, conversationID).Scan(&successorUID)
+		if err != nil || successorUID == "" {
+			_ = tx.QueryRow(`
+				SELECT profile_uid FROM conversation_members
+				WHERE conversation_id = $1
+				ORDER BY joined_at ASC LIMIT 1
+			`, conversationID).Scan(&successorUID)
+		}
+		if successorUID != "" {
+			_, _ = tx.Exec(`UPDATE conversation_members SET role = 'owner' WHERE conversation_id = $1 AND profile_uid = $2`, conversationID, successorUID)
+			_, _ = tx.Exec(`UPDATE conversations SET creator_uid = $1 WHERE id = $2`, successorUID, conversationID)
+			log.Printf("Group %d creator left. Transferred ownership to successor %s", conversationID, successorUID)
 		}
 	}
 
@@ -3334,6 +4053,7 @@ func main() {
 
 	// Database schema must be initialized using schema.sql before starting the server
 	log.Println("Assuming database schema is already initialized via schema.sql")
+	initGroupPermissionsSchema(db)
 
 	initUploadsDirectory()
 
@@ -3419,10 +4139,13 @@ func main() {
     } else {
         http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
     }
-}).Methods("DELETE", "OPTIONS")
+	}).Methods("DELETE", "OPTIONS")
+	router.HandleFunc("/groups/{groupId}", func(w http.ResponseWriter, r *http.Request) {
+		deleteGroupHandler(hub, w, r)
+	}).Methods("DELETE", "OPTIONS")
 	router.HandleFunc("/groups/{groupId}/delete", func(w http.ResponseWriter, r *http.Request) {
 		deleteGroupHandler(hub, w, r)
-	}).Methods("POST")
+	}).Methods("POST", "DELETE", "OPTIONS")
 	router.HandleFunc("/groups/{groupId}/leave", func(w http.ResponseWriter, r *http.Request) {
 		leaveGroupHandler(hub, w, r)
 	}).Methods("POST")
@@ -3456,6 +4179,26 @@ func main() {
 	}).Methods("POST")
 	router.HandleFunc("/groups/{groupId}/update", func(w http.ResponseWriter, r *http.Request) {
 		updateGroupInfoHandler(hub, w, r)
+	}).Methods("POST")
+
+	// Group Permissions & Administrative Distribution Endpoints
+	router.HandleFunc("/groups/{groupId}/permissions", func(w http.ResponseWriter, r *http.Request) {
+		getGroupPermissionsHandler(w, r)
+	}).Methods("GET")
+	router.HandleFunc("/groups/{groupId}/permissions", func(w http.ResponseWriter, r *http.Request) {
+		updateGroupPermissionsHandler(hub, w, r)
+	}).Methods("PUT", "POST")
+	router.HandleFunc("/groups/{groupId}/join-requests", func(w http.ResponseWriter, r *http.Request) {
+		getGroupJoinRequestsHandler(w, r)
+	}).Methods("GET")
+	router.HandleFunc("/groups/{groupId}/join-requests/{requestId}/review", func(w http.ResponseWriter, r *http.Request) {
+		reviewGroupJoinRequestHandler(hub, w, r)
+	}).Methods("POST")
+	router.HandleFunc("/groups/{groupId}/join-requests/batch", func(w http.ResponseWriter, r *http.Request) {
+		batchReviewGroupJoinRequestsHandler(hub, w, r)
+	}).Methods("POST")
+	router.HandleFunc("/groups/{groupId}/transfer-ownership", func(w http.ResponseWriter, r *http.Request) {
+		transferGroupOwnershipHandler(hub, w, r)
 	}).Methods("POST")
 
 	router.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {

@@ -136,14 +136,63 @@ type GroupMemberInfo struct {
 
 // GroupInfoResponse represents detailed information about a group
 type GroupInfoResponse struct {
-	ConversationID int               `json:"conversationId"`
-	GroupName      string            `json:"groupName"`
-	Description    string            `json:"description,omitempty"`
-	CreatorUID     string            `json:"creatorUid"`
-	AvatarURL      string            `json:"avatarUrl,omitempty"`
-	CreatedAt      string            `json:"createdAt"`
-	UpdatedAt      string            `json:"updatedAt"`
-	Members        []GroupMemberInfo `json:"members"`
+	ConversationID          int               `json:"conversationId"`
+	GroupName               string            `json:"groupName"`
+	Description             string            `json:"description,omitempty"`
+	CreatorUID              string            `json:"creatorUid"`
+	AvatarURL               string            `json:"avatarUrl,omitempty"`
+	CreatedAt               string            `json:"createdAt"`
+	UpdatedAt               string            `json:"updatedAt"`
+	EditGroupInfoPermission string            `json:"editGroupInfoPermission"`
+	SendMessagesPermission  string            `json:"sendMessagesPermission"`
+	AddMembersPermission    string            `json:"addMembersPermission"`
+	RequireAdminApproval    bool              `json:"requireAdminApproval"`
+	Members                 []GroupMemberInfo `json:"members"`
+}
+
+// GroupPermissionsResponse represents the group permission settings
+type GroupPermissionsResponse struct {
+	EditGroupInfoPermission string `json:"editGroupInfoPermission"`
+	SendMessagesPermission  string `json:"sendMessagesPermission"`
+	AddMembersPermission    string `json:"addMembersPermission"`
+	RequireAdminApproval    bool   `json:"requireAdminApproval"`
+}
+
+// UpdateGroupPermissionsPayload is the data sent when updating group permissions
+type UpdateGroupPermissionsPayload struct {
+	EditGroupInfoPermission *string `json:"editGroupInfoPermission,omitempty"`
+	SendMessagesPermission  *string `json:"sendMessagesPermission,omitempty"`
+	AddMembersPermission    *string `json:"addMembersPermission,omitempty"`
+	RequireAdminApproval    *bool   `json:"requireAdminApproval,omitempty"`
+}
+
+// GroupJoinRequestInfo represents a pending request to join a group
+type GroupJoinRequestInfo struct {
+	ID          int     `json:"id"`
+	GroupID     int     `json:"groupId"`
+	ProfileUID  string  `json:"profileUid"`
+	Username    string  `json:"username"`
+	DisplayName string  `json:"displayName,omitempty"`
+	AvatarURL   *string `json:"avatarUrl,omitempty"`
+	RequestedBy string  `json:"requestedBy"`
+	Status      string  `json:"status"`
+	CreatedAt   string  `json:"createdAt"`
+}
+
+// ReviewJoinRequestPayload is sent when approving or rejecting a join request
+type ReviewJoinRequestPayload struct {
+	Action string `json:"action"` // "approve" or "reject"
+}
+
+// BatchReviewJoinRequestsPayload is sent when approving or rejecting all pending join requests
+type BatchReviewJoinRequestsPayload struct {
+	Action          string `json:"action"` // "approve_all" or "reject_all"
+	DisableApproval bool   `json:"disableApproval,omitempty"`
+}
+
+// TransferOwnershipPayload is sent when the owner transfers ownership
+type TransferOwnershipPayload struct {
+	NewOwnerUID string `json:"newOwnerUid"`
 }
 
 // AddGroupMembersPayload is the data sent when adding members to a group
@@ -172,3 +221,4 @@ type UpdateGroupInfoPayload struct {
 	GroupName   string `json:"groupName,omitempty"`
 	Description string `json:"description,omitempty"`
 }
+
