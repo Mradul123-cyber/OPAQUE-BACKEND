@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -2145,6 +2146,144 @@ func deleteMessageHandler(hub *Hub, db *sql.DB) http.HandlerFunc {
     }
 }
 
+func editMessageHandler(hub *Hub, db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		token, _, err := getVerifiedToken(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
+		currentUserUID := token.UID
+
+		vars := mux.Vars(r)
+		idStr := vars["id"]
+		messageID, err := strconv.Atoi(idStr)
+		if err != nil {
+			http.Error(w, "Invalid message ID", http.StatusBadRequest)
+			return
+		}
+
+		var req struct {
+			ConversationID int    `json:"conversation_id"`
+			ContentB64     string `json:"content_b64"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+			return
+		}
+		if req.ContentB64 == "" {
+			http.Error(w, "Missing content_b64", http.StatusBadRequest)
+			return
+		}
+
+		contentBytes, err := base64.StdEncoding.DecodeString(req.ContentB64)
+		if err != nil {
+			http.Error(w, "Invalid base64 content", http.StatusBadRequest)
+			return
+		}
+
+		// Security: Validate that content is encrypted Signal Protocol / Sender Keys ciphertext
+		if len(contentBytes) < 1 {
+			http.Error(w, "Encrypted content required", http.StatusBadRequest)
+			return
+		}
+		versionByte := contentBytes[0]
+		if versionByte != 0x33 && versionByte != 0x03 {
+			http.Error(w, "Content must be Signal Protocol encrypted", http.StatusBadRequest)
+			return
+		}
+
+		var senderUID string
+		var conversationID int
+		var messageType string
+		var createdAt time.Time
+
+		err = db.QueryRow(`
+			SELECT sender_uid, conversation_id, message_type, created_at 
+			FROM messages 
+			WHERE id = $1
+		`, messageID).Scan(&senderUID, &conversationID, &messageType, &createdAt)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				http.Error(w, "Message not found", http.StatusNotFound)
+				return
+			}
+			log.Printf("DB error finding message for edit %d: %v", messageID, err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		// Security 1: Only the original sender can edit their message
+		if currentUserUID != senderUID {
+			http.Error(w, "Forbidden: You can only edit your own messages", http.StatusForbidden)
+			return
+		}
+
+		// Security 2: Cannot edit deleted messages
+		if messageType == "deleted" {
+			http.Error(w, "Cannot edit a deleted message", http.StatusBadRequest)
+			return
+		}
+
+		// Security 3: 15-minute edit window (WhatsApp standard)
+		if time.Since(createdAt) > 15*time.Minute {
+			http.Error(w, "Edit window expired (messages can only be edited within 15 minutes)", http.StatusBadRequest)
+			return
+		}
+
+		now := time.Now().UTC()
+		_, err = db.Exec(`
+			UPDATE messages 
+			SET content = $1, is_edited = TRUE, edited_at = $2 
+			WHERE id = $3
+		`, contentBytes, now, messageID)
+		if err != nil {
+			log.Printf("DB error updating edited message %d: %v", messageID, err)
+			http.Error(w, "Failed to update message", http.StatusInternalServerError)
+			return
+		}
+
+		// Also update any queued messages for offline users
+		_, _ = db.Exec(`
+			UPDATE offline_message_queue 
+			SET encrypted_content = $1 
+			WHERE message_id = $2
+		`, contentBytes, messageID)
+
+		// Prepare real-time WebSocket broadcast payload
+		editPayload := map[string]interface{}{
+			"type":            "message_edited",
+			"message_id":      messageID,
+			"conversation_id": conversationID,
+			"sender_uid":      senderUID,
+			"content_b64":     req.ContentB64,
+			"edited_at":       now.Format(time.RFC3339),
+		}
+
+		// Broadcast to all conversation members
+		memberUIDs, err := getConversationMemberUIDs(db, conversationID)
+		if err != nil {
+			log.Printf("Failed to get conversation members for edit %d: %v", conversationID, err)
+		} else {
+			for _, uid := range memberUIDs {
+				broadcastToUser(hub, uid, editPayload)
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":    true,
+			"message_id": messageID,
+			"edited_at":  now.Format(time.RFC3339),
+		})
+	}
+}
+
 func getConversationMemberUIDs(db *sql.DB, conversationID int) ([]string, error) {
     rows, err := db.Query(`
         SELECT cm.profile_uid
@@ -3127,6 +3266,8 @@ func initGroupPermissionsSchema(db *sql.DB) {
 		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS send_messages_permission VARCHAR(20) DEFAULT 'all_members'`,
 		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS add_members_permission VARCHAR(20) DEFAULT 'all_members'`,
 		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS require_admin_approval BOOLEAN DEFAULT false`,
+		`ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_edited BOOLEAN DEFAULT false`,
+		`ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP WITH TIME ZONE NULL`,
 		`CREATE TABLE IF NOT EXISTS group_join_requests (
 			id SERIAL PRIMARY KEY,
 			conversation_id INT REFERENCES conversations(id) ON DELETE CASCADE,
@@ -4140,6 +4281,12 @@ func main() {
         http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
     }
 	}).Methods("DELETE", "OPTIONS")
+	router.HandleFunc("/messages/{id:[0-9]+}/edit", basicRateLimitMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		editMessageHandler(hub, db)(w, r)
+	})).Methods("POST", "PUT", "OPTIONS")
+	router.HandleFunc("/v1/messages/{id:[0-9]+}/edit", basicRateLimitMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		editMessageHandler(hub, db)(w, r)
+	})).Methods("POST", "PUT", "OPTIONS")
 	router.HandleFunc("/groups/{groupId}", func(w http.ResponseWriter, r *http.Request) {
 		deleteGroupHandler(hub, w, r)
 	}).Methods("DELETE", "OPTIONS")
