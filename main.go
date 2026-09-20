@@ -1148,12 +1148,16 @@ func removeFriendHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	token, _, err := getVerifiedToken(r)
 	if err != nil { http.Error(w, err.Error(), http.StatusUnauthorized); return }
 	currentUserUID := token.UID
-	var p FriendRequestPayload
+	var p RemoveFriendPayload
 	if err := json.NewDecoder(r.Body).Decode(&p); err != nil { http.Error(w, "Invalid request body", http.StatusBadRequest); return }
-	targetUsername := p.TargetUsername
-	var targetUID string
-	err = db.QueryRow("SELECT firebase_uid FROM profiles WHERE username = $1", targetUsername).Scan(&targetUID)
-	if err != nil { http.Error(w, "User not found", http.StatusNotFound); return }
+	targetUID, err := p.resolveTarget(currentUserUID, func(username string) (string, error) {
+		var uid string
+		err := db.QueryRow("SELECT firebase_uid FROM profiles WHERE username = $1", username).Scan(&uid)
+		return uid, err
+	})
+	if err == errInvalidFriendTarget { http.Error(w, "Provide one valid friend identifier", http.StatusBadRequest); return }
+	if err == sql.ErrNoRows { http.Error(w, "User not found", http.StatusNotFound); return }
+	if err != nil { http.Error(w, "Could not resolve friend", http.StatusInternalServerError); return }
 
 	userA := currentUserUID
 	userB := targetUID
@@ -1178,7 +1182,7 @@ func removeFriendHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	hub.broadcast <- HubMessage{message: updateBytes, recipients: recipients}
 
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "Friend %s removed", targetUsername)
+	fmt.Fprint(w, "Friend removed")
 	log.Printf("Friend %s removed by %s", targetUID, currentUserUID)
 }
 
@@ -1493,7 +1497,13 @@ func getConversationsHandler(w http.ResponseWriter, r *http.Request) {
 				) THEN NULL
 				ELSE p.profile_avatar_url 
 			END AS partner_avatar_url,
-			p.firebase_uid AS partner_uid
+			p.firebase_uid AS partner_uid,
+            (NOT c.is_group AND EXISTS (
+                SELECT 1 FROM friendships f
+                WHERE ((f.user_a_uid = $1 AND f.user_b_uid = p.firebase_uid)
+                    OR (f.user_b_uid = $1 AND f.user_a_uid = p.firebase_uid))
+                  AND f.status = 'accepted'
+            )) AS is_friend
 		FROM
 			conversations AS c
 		JOIN
@@ -1520,7 +1530,7 @@ func getConversationsHandler(w http.ResponseWriter, r *http.Request) {
 		var groupName, creatorUID, groupAvatarURL, partnerUsername, partnerDisplayName, partnerAvatarURL, partnerUID sql.NullString
 
 		// Scan including partner_display_name
-		if err := rows.Scan(&convo.ConversationID, &convo.IsGroup, &groupName, &creatorUID, &groupAvatarURL, &partnerUsername, &partnerDisplayName, &partnerAvatarURL, &partnerUID); err != nil {
+		if err := rows.Scan(&convo.ConversationID, &convo.IsGroup, &groupName, &creatorUID, &groupAvatarURL, &partnerUsername, &partnerDisplayName, &partnerAvatarURL, &partnerUID, &convo.IsFriend); err != nil {
 			log.Printf("Error scanning conversation row: %v", err)
 			continue
 		}

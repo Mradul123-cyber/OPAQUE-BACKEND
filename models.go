@@ -16,6 +16,7 @@ type FriendInfo struct {
 // ConversationInfoResponse is the structure for the /conversations API response.
 // It provides all necessary info for the Flutter home screen.
 type ConversationInfoResponse struct {
+	IsFriend bool `json:"isFriend"`
 	ConversationID int    `json:"conversationId"`
 	IsGroup        bool   `json:"isGroup"`
 	ChatTitle      string `json:"chatTitle"`
