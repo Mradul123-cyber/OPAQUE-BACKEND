@@ -2925,13 +2925,17 @@ func editMessageHandler(hub *Hub, db *sql.DB) http.HandlerFunc {
 		}
 
 		var req struct {
-			ConversationID int    `json:"conversation_id"`
-			ContentB64     string `json:"content_b64"`
-			SenderDeviceID int    `json:"sender_device_id"`
+			ConversationID    int    `json:"conversation_id"`
+			ContentB64        string `json:"content_b64"`
+			SenderDeviceID    int    `json:"sender_device_id"`
+			SenderDeviceIDAlt int    `json:"senderDeviceId"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
 			return
+		}
+		if req.SenderDeviceID == 0 && req.SenderDeviceIDAlt > 0 {
+			req.SenderDeviceID = req.SenderDeviceIDAlt
 		}
 		if req.ContentB64 == "" {
 			http.Error(w, "Missing content_b64", http.StatusBadRequest)
@@ -3017,6 +3021,9 @@ func editMessageHandler(hub *Hub, db *sql.DB) http.HandlerFunc {
 			WHERE message_id = $2
 		`, contentBytes, messageID)
 
+		var isGroup bool
+		_ = db.QueryRow("SELECT COALESCE(is_group, false) FROM conversations WHERE id = $1", conversationID).Scan(&isGroup)
+
 		// Prepare real-time WebSocket broadcast payload
 		editPayload := map[string]interface{}{
 			"type":             "message_edited",
@@ -3026,6 +3033,7 @@ func editMessageHandler(hub *Hub, db *sql.DB) http.HandlerFunc {
 			"sender_device_id": senderDeviceID,
 			"content_b64":      req.ContentB64,
 			"edited_at":        now.Format(time.RFC3339),
+			"is_group":         isGroup,
 		}
 
 		// Broadcast to all conversation members

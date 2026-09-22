@@ -140,39 +140,58 @@ func broadcastToUser(hub *Hub, uid string, message map[string]interface{}) {
         case targetClient.send <- messageBytes:
 //             log.Printf("Message sent to user %s (%s) via WebSocket", uid, targetClient.username)
         default:
-            log.Printf("Failed to send message to user %s, channel full", uid)
+            log.Printf("Failed to send message to user %s, channel full - dropping client and queueing offline", uid)
+            delete(hub.clients, uid)
+            queueOfflineNotification(uid, message)
         }
     } else {
         // User is offline
         log.Printf("User %s not found in connected clients (total clients: %d)", uid, len(hub.clients))
-        
-        // Debug: Show what clients we do have
-        //log.Printf("DEBUG: Current online clients:")
-        //for clientUID, client := range hub.clients {
-          //  log.Printf("DEBUG: - UID: %s, Username: %s", clientUID, client.username)
-        //}
-        
-        // Handle offline message
-        if messageType, ok := message["type"].(string); ok {
-            switch messageType {
-            case "message_status":
-                queueStatusUpdateForOfflineUser(uid, message)
-            case "new_message":
-                sendNewMessageNotificationFromMessage(uid, message)
-            case "message_deleted":
-                queueDeletionForOfflineUser(uid, message)
-            case "attachment_uploaded":
-                queueAttachmentNotificationForOfflineUser(uid, message)
-            }
-        }
+        queueOfflineNotification(uid, message)
+    }
+}
+
+func queueOfflineNotification(uid string, message map[string]interface{}) {
+    messageType, ok := message["type"].(string)
+    if !ok {
+        return
+    }
+    switch messageType {
+    case "message_status":
+        queueStatusUpdateForOfflineUser(uid, message)
+    case "new_message":
+        sendNewMessageNotificationFromMessage(uid, message)
+    case "message_deleted":
+        queueDeletionForOfflineUser(uid, message)
+    case "attachment_uploaded":
+        queueAttachmentNotificationForOfflineUser(uid, message)
+    case "session_reset_required":
+        dataJSON, _ := json.Marshal(message)
+        senderUID, _ := message["sender_uid"].(string)
+        _, _ = db.Exec(`
+            INSERT INTO offline_message_queue (recipient_uid, sender_uid, conversation_id, message_id, message_type, message_data, created_at)
+            VALUES ($1, $2, 0, 0, 'session_reset_required', $3, NOW())
+        `, uid, senderUID, dataJSON)
+    case "message_edited":
+        dataJSON, _ := json.Marshal(message)
+        senderUID, _ := message["sender_uid"].(string)
+        convID, _ := message["conversation_id"].(int)
+        msgID, _ := message["message_id"].(int)
+        _, _ = db.Exec(`
+            INSERT INTO offline_message_queue (recipient_uid, sender_uid, conversation_id, message_id, message_type, message_data, created_at)
+            VALUES ($1, $2, $3, $4, 'message_edited', $5, NOW())
+        `, uid, senderUID, convID, msgID, dataJSON)
     }
 }
 
 
 
 func handleSessionResetNotification(hub *Hub, client *Client, data map[string]interface{}) {
-	recipientUID, ok := data["recipient_uid"].(string)
-	if !ok {
+	recipientUID, ok := data["target_uid"].(string)
+	if !ok || recipientUID == "" {
+		recipientUID, ok = data["recipient_uid"].(string)
+	}
+	if !ok || recipientUID == "" {
 		log.Printf("Invalid or missing recipient_uid in session_reset_required from %s", client.username)
 		return
 	}
@@ -182,17 +201,17 @@ func handleSessionResetNotification(hub *Hub, client *Client, data map[string]in
 	data["sender_uid"] = client.uid
 	data["sender_username"] = client.username
 
+	messageBytes, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("Error marshaling session reset notification: %v", err)
+		return
+	}
+
 	hub.mu.RLock()
 	recipientClient, exists := hub.clients[recipientUID]
 	hub.mu.RUnlock()
 
 	if exists {
-		messageBytes, err := json.Marshal(data)
-		if err != nil {
-			log.Printf("Error marshaling session reset notification: %v", err)
-			return
-		}
-
 		select {
 		case recipientClient.send <- messageBytes:
 			log.Printf("Forwarded session reset notification to %s", recipientUID)
@@ -200,7 +219,15 @@ func handleSessionResetNotification(hub *Hub, client *Client, data map[string]in
 			log.Printf("Failed to forward session reset notification to %s", recipientUID)
 		}
 	} else {
-		log.Printf("Recipient %s offline, session reset notification dropped", recipientUID)
+		log.Printf("Recipient %s offline, queuing session_reset_required notification in offline_message_queue", recipientUID)
+		query := `
+			INSERT INTO offline_message_queue (recipient_uid, sender_uid, conversation_id, message_id, message_type, message_data, created_at)
+			VALUES ($1, $2, 0, 0, 'session_reset_required', $3, NOW())
+		`
+		_, err = db.Exec(query, recipientUID, client.uid, messageBytes)
+		if err != nil {
+			log.Printf("Failed to queue session_reset_required for offline user %s: %v", recipientUID, err)
+		}
 	}
 }
 
@@ -1160,6 +1187,30 @@ func handleStatusUpdate(client *Client, statusData map[string]interface{}, hub *
         }
         hub.statusMu.Unlock()
 
+        // Check if message is already read - never downgrade to delivered
+        if status == "delivered" {
+                var isAlreadyRead bool
+                err := db.QueryRow(`
+                        SELECT EXISTS(
+                                SELECT 1 FROM message_status 
+                                WHERE message_id = $1 AND recipient_uid = $2 AND read_at IS NOT NULL
+                        )
+                `, int(messageId), client.uid).Scan(&isAlreadyRead)
+                if err == nil && isAlreadyRead {
+                        // Already read: Do not broadcast 'delivered' to sender
+                        ackPayload := map[string]interface{}{
+                                "type":       "message_ack",
+                                "message_id": int(messageId),
+                        }
+                        ackBytes, _ := json.Marshal(ackPayload)
+                        select {
+                        case client.send <- ackBytes:
+                        default:
+                        }
+                        return
+                }
+        }
+
         // Update database
         err := updateMessageStatusInDB(int(messageId), client.uid, status, db)
         if err != nil {
@@ -1188,7 +1239,6 @@ func handleStatusUpdate(client *Client, statusData map[string]interface{}, hub *
         }
 
         broadcastToUser(hub, senderUID, statusResponse)
-//         log.Printf("✅ Broadcasted status %s for message %d to sender %s", status, int(messageId), senderUID)
 
         // ✅ FIX: Send ACK back to client who sent the status update
         ackPayload := map[string]interface{}{
@@ -1198,7 +1248,6 @@ func handleStatusUpdate(client *Client, statusData map[string]interface{}, hub *
         ackBytes, _ := json.Marshal(ackPayload)
         select {
         case client.send <- ackBytes:
-//                 log.Printf("✅ ACK sent for status update (message %d)", int(messageId))
         default:
                 log.Printf("⚠️ Failed to send ACK for status update (message %d)", int(messageId))
         }
@@ -1214,7 +1263,7 @@ func updateMessageStatusInDB(messageID int, recipientUID string, status string, 
 		query = `
 			UPDATE message_status 
 			SET delivered_at = NOW() 
-			WHERE message_id = $1 AND recipient_uid = $2 AND delivered_at IS NULL
+			WHERE message_id = $1 AND recipient_uid = $2 AND delivered_at IS NULL AND read_at IS NULL
 		`
 	case "read":
 		query = `

@@ -379,6 +379,36 @@ if err == nil && existingDeviceId.Valid {
 		return
 	}
 
+	// If this user was already registered previously, notify all conversation partners
+	// so their clients immediately clear stale Signal sessions and device ID caches.
+	if existingDeviceId.Valid {
+		go func(userUID string, newDevID int) {
+			rows, err := db.Query(`
+				SELECT DISTINCT cm2.profile_uid 
+				FROM conversation_members cm1
+				JOIN conversation_members cm2 ON cm1.conversation_id = cm2.conversation_id
+				WHERE cm1.profile_uid = $1 AND cm2.profile_uid != $1
+			`, userUID)
+			if err != nil {
+				return
+			}
+			defer rows.Close()
+
+			notification := map[string]interface{}{
+				"type":             "session_reset_required",
+				"sender_uid":       userUID,
+				"sender_device_id": newDevID,
+				"reason":           "device_re_registered",
+			}
+			for rows.Next() {
+				var partnerUID string
+				if err := rows.Scan(&partnerUID); err == nil && partnerUID != "" {
+					broadcastToUser(globalHub, partnerUID, notification)
+				}
+			}
+		}(authUID, req.DeviceID)
+	}
+
 	// Success response
 	resp := struct {
 		InsertedOneTimePrekeys int    `json:"inserted_one_time_prekeys"`
@@ -759,48 +789,49 @@ func sendMessageHandler(w http.ResponseWriter, r *http.Request) {
 			//log.Printf("DEBUG: message_status inserted successfully for %s", r.UID)
 		}
 
-		// Queue message for offline users
-		// In the recipient processing loop, update the offline queueing
-if !r.IsOnline {
-    // Decode session context
-    var sessionContextBytes []byte
-    if req.SessionContextB64 != "" {
-        var err error
-        sessionContextBytes, err = base64.StdEncoding.DecodeString(req.SessionContextB64)
-        if err != nil {
-            log.Printf("ERROR: Invalid session context base64: %v", err)
-            sessionContextBytes = nil
-        }
-    }
-    
-    //log.Printf("DEBUG: Queueing offline message with session context for %s", r.UID)
-    _, err = tx.Exec(`
-        INSERT INTO offline_message_queue (recipient_uid, sender_uid, conversation_id, message_id, encrypted_content, session_context, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, NOW() AT TIME ZONE 'UTC')
-    `, r.UID, senderUID, req.ConversationID, messageID, contentBytes, sessionContextBytes)
-    
-	var senderDisplayName string
-	err = db.QueryRow(`SELECT username FROM profiles WHERE firebase_uid = $1`, senderUID).Scan(&senderDisplayName)
-
-    if err != nil {
-        log.Printf("ERROR: offline queue insert failed for %s: %v", r.UID, err)
-    } else {
-        //log.Printf("DEBUG: offline message with session context queued successfully for %s", r.UID)
-
-		messageData := map[string]interface{}{
-			"type":             "new_message",
-			"message_id":       messageID,
-			"conversation_id":  req.ConversationID,
-			"sender_uid":       senderUID,
-			"sender_username":  senderDisplayName,
-			"content_b64":      req.ContentB64, // Encrypted content
-			"sender_device_id": senderDeviceID,
-			"message_type":     coalesceString(req.MessageType, "chat"),
-			"is_group":         isGroup,
+		// Decode session context
+		var sessionContextBytes []byte
+		if req.SessionContextB64 != "" {
+			var err error
+			sessionContextBytes, err = base64.StdEncoding.DecodeString(req.SessionContextB64)
+			if err != nil {
+				log.Printf("ERROR: Invalid session context base64: %v", err)
+				sessionContextBytes = nil
+			}
 		}
-		sendNewMessageNotificationFromMessage(r.UID, messageData)
-    }
-}
+
+		// ALWAYS queue message in offline_message_queue for reliable delivery.
+		// If recipient is online, they receive via live WebSocket and immediately send "delivered" status,
+		// which marks offline_message_queue.delivered = true.
+		// If recipient was in airplane mode or network toggle (ghost connection), they never ACK,
+		// and deliverOfflineMessages flushes it to them as soon as they reconnect!
+		_, err = tx.Exec(`
+			INSERT INTO offline_message_queue (recipient_uid, sender_uid, conversation_id, message_id, encrypted_content, session_context, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, NOW() AT TIME ZONE 'UTC')
+		`, r.UID, senderUID, req.ConversationID, messageID, contentBytes, sessionContextBytes)
+
+		var senderDisplayName string
+		err = db.QueryRow(`SELECT username FROM profiles WHERE firebase_uid = $1`, senderUID).Scan(&senderDisplayName)
+
+		if err != nil {
+			log.Printf("ERROR: offline queue insert failed for %s: %v", r.UID, err)
+		} else {
+			log.Printf("Offline message %d queued for %s (isOnline=%v)", messageID, r.UID, r.IsOnline)
+			if !r.IsOnline {
+				messageData := map[string]interface{}{
+					"type":             "new_message",
+					"message_id":       messageID,
+					"conversation_id":  req.ConversationID,
+					"sender_uid":       senderUID,
+					"sender_username":  senderDisplayName,
+					"content_b64":      req.ContentB64, // Encrypted content
+					"sender_device_id": senderDeviceID,
+					"message_type":     coalesceString(req.MessageType, "chat"),
+					"is_group":         isGroup,
+				}
+				sendNewMessageNotificationFromMessage(r.UID, messageData)
+			}
+		}
 	}
 
 // log.Printf("DEBUG: Checking if sender %s is online...", senderUID)
@@ -1797,7 +1828,7 @@ func getUserDeviceHandler(w http.ResponseWriter, r *http.Request) {
     
     // Query your devices table
     var deviceID int
-    err = db.QueryRow("SELECT device_id FROM devices WHERE firebase_uid = $1 LIMIT 1", targetUID).Scan(&deviceID)
+    err = db.QueryRow("SELECT device_id FROM devices WHERE firebase_uid = $1 ORDER BY last_seen_at DESC NULLS LAST, created_at DESC LIMIT 1", targetUID).Scan(&deviceID)
     
     if err != nil {
         if err == sql.ErrNoRows {
@@ -1888,8 +1919,8 @@ for rows.Next() {
 
     var wsMessage map[string]interface{}
 
-    // Check if this is a message_deleted or attachment_uploaded notification
-    if messageType.Valid && (messageType.String == "message_deleted" || messageType.String == "attachment_uploaded") && len(messageData) > 0 {
+    // Check if this is a message_deleted, attachment_uploaded, session_reset_required, or message_edited notification
+    if messageType.Valid && (messageType.String == "message_deleted" || messageType.String == "attachment_uploaded" || messageType.String == "session_reset_required" || messageType.String == "message_edited") && len(messageData) > 0 {
         // Unmarshal the stored JSON
         err = json.Unmarshal(messageData, &wsMessage)
         if err != nil {
