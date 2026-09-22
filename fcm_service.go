@@ -103,7 +103,7 @@ func sendNewMessageNotification(recipientUID string, senderUID string, senderUse
 		"recipient_uid":    recipientUID,
 		"content_b64":      contentB64,
 		"sender_device_id": fmt.Sprintf("%d", senderDeviceID),
-		"message_type":     messageType,
+		"msg_type":         messageType,
 		"is_group":         fmt.Sprintf("%t", isGroup),
 		"click_action":     "FLUTTER_NOTIFICATION_CLICK",
 	}

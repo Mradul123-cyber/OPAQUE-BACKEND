@@ -1559,12 +1559,17 @@ func markConversationAsReadHandler(w http.ResponseWriter, r *http.Request) {
 
 // Broadcast status updates to senders for each message that was marked as read
 if rowsAffected > 0 {
-    // Get the message IDs and sender UIDs that were marked as read
+    // Only fetch messages whose read_at was set right now (last 10 seconds)
+    // to avoid re-broadcasting stale receipts that the dedup cache would drop
     rows, err := db.Query(`
         SELECT DISTINCT m.id, m.sender_uid 
         FROM messages m 
         JOIN message_status ms ON m.id = ms.message_id 
-        WHERE m.conversation_id = $1 AND ms.recipient_uid = $2 AND ms.read_at IS NOT NULL
+        WHERE m.conversation_id = $1 
+          AND ms.recipient_uid = $2 
+          AND ms.read_at IS NOT NULL
+          AND ms.read_at >= NOW() - INTERVAL '10 seconds'
+          AND m.sender_uid != $2
     `, conversationID, authUID)
     
     if err == nil {
@@ -1573,7 +1578,6 @@ if rowsAffected > 0 {
             var messageID int
             var senderUID string
             if err := rows.Scan(&messageID, &senderUID); err == nil {
-                // Broadcast read status to the sender using your existing function
                 statusMessage := map[string]interface{}{
                     "type":            "message_status",
                     "message_id":      messageID,
