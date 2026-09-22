@@ -17,15 +17,19 @@ import (
 
 const (
 	maxFileSize       = 100 * 1024 * 1024 // 100MB
-	uploadsDir        = "./uploads"
 	allowedImageTypes = "image/jpeg,image/png,image/jpg,image/gif,image/webp"
 	allowedVideoTypes = "video/mp4,video/quicktime,video/x-msvideo,video/x-matroska"
 	allowedAudioTypes = "audio/aac,audio/mp4,audio/mpeg,audio/ogg,audio/wav,audio/webm,audio/x-m4a"
 	allowedDocumentTypes = "application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.ms-powerpoint,application/zip,application/x-rar-compressed,text/plain,text/csv,application/x-zip-compressed"
 )
 
+var uploadsDir = "./uploads"
+
 // Initialize uploads directory for encrypted chat attachments
 func initUploadsDirectory() {
+	if envDir := os.Getenv("UPLOADS_DIR"); envDir != "" {
+		uploadsDir = envDir
+	}
 	if err := os.MkdirAll(uploadsDir, 0755); err != nil {
 		log.Fatal("Failed to create uploads directory: ", err)
 	}

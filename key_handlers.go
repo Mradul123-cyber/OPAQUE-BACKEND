@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -8,9 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"strings"
-	"bytes"
 
 	"firebase.google.com/go/v4/auth"
 )
@@ -18,11 +17,6 @@ import (
 // verifyFirebaseToken is a helper function to authenticate a request
 // and return the user's token, which contains their UID.
 func verifyFirebaseToken(r *http.Request) (*auth.Token, error) {
-	if os.Getenv("ZARQ_ENV") == "development" {
-		log.Println("--- WARNING: AUTHENTICATION BYPASSED (DEV MODE) ---")
-		return &auth.Token{UID: "test-user-firebase-uid"}, nil
-	}
-
 	idToken := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if idToken == "" {
 		return nil, errors.New("authorization header not found")

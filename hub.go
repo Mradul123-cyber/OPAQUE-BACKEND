@@ -70,6 +70,7 @@ type IncomingChatMessage struct {
 	ConversationID int    `json:"conversationId"`
 	Content        string `json:"content"`
 	ClientID       int64  `json:"clientId"`
+	SenderDeviceID int    `json:"sender_device_id"`
 }
 
 // Simplified Message struct for responses
@@ -523,26 +524,20 @@ func sendNewMessageNotificationFromMessage(recipientUID string, message map[stri
 		senderUsername = "New Message"
 	}
 	
-	// Extract sender UID from the message - ADDED THIS
+	// Extract sender UID from the message
 	senderUID, _ := message["sender_uid"].(string)
 	if senderUID == "" {
 		log.Printf("Warning: No sender_uid in message for notification")
 		return // Can't send notification without sender UID for quick reply
 	}
 	
-	// For new_message type, we need to decode the content
 	contentB64, _ := message["content_b64"].(string)
 	messageContent := "You have a new message"
 	
-	if contentB64 != "" {
-		// Try to decode the base64 content for notification preview
-		// Note: This will be encrypted content, so we'll just show a generic message
-		messageContent = "You have a new message"
-	}
-	
-	// Extract conversation and message IDs
+	// Extract conversation, message, and device IDs
 	var conversationID int
 	var messageID int
+	var senderDeviceID int
 	
 	if convID, ok := message["conversation_id"]; ok {
 		switch v := convID.(type) {
@@ -561,9 +556,25 @@ func sendNewMessageNotificationFromMessage(recipientUID string, message map[stri
 			messageID = int(v)
 		}
 	}
+
+	if devID, ok := message["sender_device_id"]; ok {
+		switch v := devID.(type) {
+		case int:
+			senderDeviceID = v
+		case float64:
+			senderDeviceID = int(v)
+		}
+	}
+
+	messageType, _ := message["message_type"].(string)
+	if messageType == "" {
+		messageType = "chat"
+	}
+
+	isGroup, _ := message["is_group"].(bool)
 	
-	// Send the push notification - NOW WITH senderUID
-	sendNewMessageNotification(recipientUID, senderUID, senderUsername, messageContent, conversationID, messageID)
+	// Send the push notification with full E2EE ciphertext and metadata
+	sendNewMessageNotification(recipientUID, senderUID, senderUsername, messageContent, conversationID, messageID, contentB64, senderDeviceID, messageType, isGroup)
 }
 
 // Queue deletion notification for offline user
@@ -928,6 +939,18 @@ func (c *Client) writePump() {
 	}
 }
 
+// areFriends checks if two users have an accepted friendship.
+// user_a_uid must be lexicographically ≤ user_b_uid per schema constraint.
+func areFriends(uid1, uid2 string) bool {
+	userA, userB := uid1, uid2
+	if userA > userB {
+		userA, userB = userB, userA
+	}
+	var exists bool
+	db.QueryRow(`SELECT EXISTS(SELECT 1 FROM friendships WHERE user_a_uid=$1 AND user_b_uid=$2 AND status='accepted')`, userA, userB).Scan(&exists)
+	return exists
+}
+
 func handlePresenceQuery(client *Client, queryData map[string]interface{}) {
 	targetUID, ok := queryData["target_uid"].(string)
 	if !ok {
@@ -958,6 +981,43 @@ func handlePresenceQuery(client *Client, queryData map[string]interface{}) {
 		}
 	} else {
 		lastSeen = time.Now().UTC()
+	}
+
+	// Check last_seen_privacy of the target user before responding
+	var lsPrivacy string
+	if err := db.QueryRow("SELECT COALESCE(last_seen_privacy, 'everyone') FROM profiles WHERE firebase_uid = $1", targetUID).Scan(&lsPrivacy); err != nil {
+		lsPrivacy = "everyone"
+	}
+
+	canSeePresence := false
+	switch lsPrivacy {
+	case "everyone":
+		canSeePresence = true
+	case "friends":
+		canSeePresence = areFriends(client.uid, targetUID)
+	case "nobody":
+		canSeePresence = false
+	}
+
+	if !canSeePresence {
+		// Return a hidden response — user appears offline with no last_seen
+		hiddenResponse := map[string]interface{}{
+			"type":      "presence_status",
+			"user_uid":  targetUID,
+			"is_online": false,
+			"last_seen": nil,
+			"hidden":    true,
+		}
+		hiddenJSON, err := json.Marshal(hiddenResponse)
+		if err != nil {
+			return
+		}
+		select {
+		case client.send <- hiddenJSON:
+		default:
+			log.Printf("Failed to send hidden presence response to %s (buffer full)", client.username)
+		}
+		return
 	}
 
 	// Send presence response
@@ -1172,6 +1232,13 @@ func updateMessageStatusInDB(messageID int, recipientUID string, status string, 
 	if err != nil {
 		return fmt.Errorf("database update failed: %v", err)
 	}
+
+	// Also mark offline_message_queue as delivered so it won't be re-delivered on reconnect
+	_, _ = db.Exec(`
+		UPDATE offline_message_queue 
+		SET delivered = true, delivered_at = NOW() 
+		WHERE message_id = $1 AND recipient_uid = $2 AND delivered = false
+	`, messageID, recipientUID)
 	
 	rowsAffected, _ := result.RowsAffected()
 	log.Printf("Updated %d message_status rows for message %d, recipient %s, status %s", 
@@ -1198,6 +1265,16 @@ func getMessageSender(messageID int, db *sql.DB) (string, error) {
 // Broadcast presence status to all friends/conversation members
 func broadcastPresenceStatus(userUID string, isOnline bool, lastSeen time.Time) {
 // 	log.Printf("Broadcasting presence for %s: online=%v", userUID, isOnline)
+
+	// Fetch the broadcasting user's last_seen_privacy once before querying recipients
+	var lsPrivacy string
+	if err := db.QueryRow("SELECT COALESCE(last_seen_privacy, 'everyone') FROM profiles WHERE firebase_uid = $1", userUID).Scan(&lsPrivacy); err != nil {
+		lsPrivacy = "everyone"
+	}
+	// If nobody, skip broadcast entirely — no one should know this user's presence
+	if lsPrivacy == "nobody" {
+		return
+	}
 
 	// Get all users who should receive this presence update (friends + conversation members)
 	query := `
@@ -1256,6 +1333,11 @@ func broadcastPresenceStatus(userUID string, isOnline bool, lastSeen time.Time) 
 	for rows.Next() {
 		var recipientUID string
 		if err := rows.Scan(&recipientUID); err != nil {
+			continue
+		}
+
+		// Privacy filter: if 'friends', only broadcast to accepted friends (not just conversation members)
+		if lsPrivacy == "friends" && !areFriends(userUID, recipientUID) {
 			continue
 		}
 
@@ -1447,12 +1529,23 @@ func (h *Hub) run() {
 			// Convert string content to bytes for BYTEA column
 			contentBytes := []byte(newMsg.Content)
 
+			// Determine sender device ID:
+			// 1) From incoming message if provided
+			senderDeviceID := incomingMsg.SenderDeviceID
+			if senderDeviceID <= 0 {
+				// 2) Fallback to sender's registered device in DB
+				err := h.db.QueryRow("SELECT device_id FROM devices WHERE firebase_uid = $1 ORDER BY last_seen_at DESC NULLS LAST LIMIT 1", sender.uid).Scan(&senderDeviceID)
+				if err != nil || senderDeviceID <= 0 {
+					senderDeviceID = 1
+				}
+			}
+
 			err := h.db.QueryRow(
 				sqlStatement,
 				conversationID,
 				sender.uid,
 				contentBytes,           // BYTEA content
-				1,                     // sender_device_id
+				senderDeviceID,        // sender_device_id
 				"sent",               // status
 				"chat",               // message_type
 				newMsg.ReplyToMessageID, // reply_to_message_id (can be nil)
@@ -1516,7 +1609,7 @@ func (h *Hub) run() {
 				"sender_username":  sender.username,
 				"content_b64":      base64.StdEncoding.EncodeToString([]byte(newMsg.Content)),
 				"created_at":       createdAt.UTC().Format(time.RFC3339),
-				"sender_device_id": 1, // Default device ID
+				"sender_device_id": senderDeviceID,
 				"message_type":     "chat",
 				"is_group":         isGroup,
 			}

@@ -591,21 +591,83 @@ func sendMessageHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 1) Verify sender is a member of conversation and check announcement mode permissions
 	var userRole, sendMsgPerm sql.NullString
+	var isGroup bool
 	err = tx.QueryRow(`
-		SELECT cm.role, COALESCE(c.send_messages_permission, 'all_members')
+		SELECT cm.role, COALESCE(c.send_messages_permission, 'all_members'), COALESCE(c.is_group, false)
 		FROM conversation_members cm
 		JOIN conversations c ON cm.conversation_id = c.id
 		WHERE cm.conversation_id = $1 AND cm.profile_uid = $2
-	`, req.ConversationID, senderUID).Scan(&userRole, &sendMsgPerm)
+	`, req.ConversationID, senderUID).Scan(&userRole, &sendMsgPerm, &isGroup)
 	if err != nil {
 		log.Printf("sendMessageHandler: check membership error: %v", err)
 		http.Error(w, "not a member of conversation", http.StatusForbidden)
 		return
 	}
-	if sendMsgPerm.Valid && sendMsgPerm.String == "only_admins" && userRole.Valid && userRole.String != "owner" && userRole.String != "admin" {
+	if isGroup && sendMsgPerm.Valid && sendMsgPerm.String == "only_admins" && userRole.Valid && userRole.String != "owner" && userRole.String != "admin" {
 		log.Printf("sendMessageHandler: rejected message from non-admin %s in announcement-only group %d", senderUID, req.ConversationID)
-		http.Error(w, "only admins can send messages to this group", http.StatusForbidden)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":   "permission_denied",
+			"message": "Only admins can send messages to this group",
+		})
 		return
+	}
+
+	// For direct (1-on-1) chats, enforce recipient's message privacy settings
+	if !isGroup {
+		var recipientUID string
+		err = tx.QueryRow(`
+			SELECT profile_uid FROM conversation_members 
+			WHERE conversation_id = $1 AND profile_uid != $2 LIMIT 1
+		`, req.ConversationID, senderUID).Scan(&recipientUID)
+		if err == nil && recipientUID != "" {
+			// If recipient has already sent a message in this conversation, they initiated/participated in the chat,
+			// so allow the other user to reply regardless of recipient's privacy setting.
+			var recipientSentMessage bool
+			tx.QueryRow(`
+				SELECT EXISTS(
+					SELECT 1 FROM messages 
+					WHERE conversation_id = $1 AND sender_uid = $2
+				)
+			`, req.ConversationID, recipientUID).Scan(&recipientSentMessage)
+
+			if !recipientSentMessage {
+				var msgPrivacy string
+				err = tx.QueryRow("SELECT COALESCE(message_privacy, 'everyone') FROM profiles WHERE firebase_uid = $1", recipientUID).Scan(&msgPrivacy)
+				if err != nil {
+					msgPrivacy = "everyone"
+				}
+				if msgPrivacy == "nobody" {
+					log.Printf("sendMessageHandler: rejected direct message to %s - recipient has message_privacy='nobody' and has not sent any message in conversation", recipientUID)
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusForbidden)
+					json.NewEncoder(w).Encode(map[string]string{
+						"error":   "messaging_restricted",
+						"message": "This user is not accepting messages",
+					})
+					return
+				}
+				if msgPrivacy == "friends" {
+					userA, userB := senderUID, recipientUID
+					if userA > userB {
+						userA, userB = userB, userA
+					}
+					var friendshipExists bool
+					tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM friendships WHERE user_a_uid=$1 AND user_b_uid=$2 AND status='accepted')`, userA, userB).Scan(&friendshipExists)
+					if !friendshipExists {
+						log.Printf("sendMessageHandler: rejected direct message to %s - recipient has message_privacy='friends', has not messaged first, and not friends", recipientUID)
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusForbidden)
+						json.NewEncoder(w).Encode(map[string]string{
+							"error":   "not_friends",
+							"message": "This user only accepts messages from friends",
+						})
+						return
+					}
+				}
+			}
+		}
 	}
 	// 2) Insert message
 	var senderDeviceID int
@@ -726,14 +788,17 @@ if !r.IsOnline {
         //log.Printf("DEBUG: offline message with session context queued successfully for %s", r.UID)
 
 		messageData := map[string]interface{}{
-        "type":            "new_message",
-        "message_id":      messageID,
-        "conversation_id": req.ConversationID,
-        "sender_uid":      senderUID,
-        "sender_username": senderDisplayName,
-        "content_b64":     req.ContentB64, // Encrypted content
-    }
-    sendNewMessageNotificationFromMessage(r.UID, messageData)
+			"type":             "new_message",
+			"message_id":       messageID,
+			"conversation_id":  req.ConversationID,
+			"sender_uid":       senderUID,
+			"sender_username":  senderDisplayName,
+			"content_b64":      req.ContentB64, // Encrypted content
+			"sender_device_id": senderDeviceID,
+			"message_type":     coalesceString(req.MessageType, "chat"),
+			"is_group":         isGroup,
+		}
+		sendNewMessageNotificationFromMessage(r.UID, messageData)
     }
 }
 	}
@@ -868,10 +933,11 @@ func getOfflineMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	// Get all undelivered messages for this user
 	rows, err := tx.Query(`
     SELECT omq.message_id, omq.sender_uid, omq.conversation_id, omq.encrypted_content, omq.session_context, omq.created_at,
-           p.username as sender_username, omq.id as queue_id, c.is_group
+           p.username as sender_username, omq.id as queue_id, c.is_group, COALESCE(m.sender_device_id, 1) as sender_device_id
     FROM offline_message_queue omq
     JOIN profiles p ON p.firebase_uid = omq.sender_uid
     JOIN conversations c ON c.id = omq.conversation_id
+    LEFT JOIN messages m ON m.id = omq.message_id
     WHERE omq.recipient_uid = $1 AND omq.delivered = false
     ORDER BY omq.created_at ASC
 `, userUID)
@@ -897,8 +963,9 @@ func getOfflineMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		var queueID int
 		var sessionContext []byte
 		var isGroup bool
+		var senderDeviceID int
 
-		err := rows.Scan(&messageID, &senderUID, &conversationID, &encryptedContent, &sessionContext, &createdAt, &senderUsername, &queueID, &isGroup)
+		err := rows.Scan(&messageID, &senderUID, &conversationID, &encryptedContent, &sessionContext, &createdAt, &senderUsername, &queueID, &isGroup, &senderDeviceID)
 
 		if err != nil {
 			log.Printf("getOfflineMessagesHandler: scan error: %v", err)
@@ -909,15 +976,15 @@ func getOfflineMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		contentB64 := base64.StdEncoding.EncodeToString(encryptedContent)
 
 		message := map[string]interface{}{
-			"message_id":      messageID,
-			"sender_uid":      senderUID,
-			"sender_username": senderUsername,
-			"conversation_id": conversationID,
-			"content_b64":     contentB64,
+			"message_id":          messageID,
+			"sender_uid":          senderUID,
+			"sender_username":     senderUsername,
+			"conversation_id":     conversationID,
+			"content_b64":         contentB64,
 			"session_context_b64": "",
-			"created_at":      createdAt.UTC().Format(time.RFC3339),
-			"sender_device_id": 1, // Default device ID
-			"is_group":        isGroup,
+			"created_at":          createdAt.UTC().Format(time.RFC3339),
+			"sender_device_id":    senderDeviceID,
+			"is_group":            isGroup,
 		}
 
 		if sessionContext != nil {
@@ -1345,7 +1412,7 @@ func getMissedMessagesHandler(w http.ResponseWriter, r *http.Request) {
 
     // Query messages for user's conversations since the timestamp
     query := `
-    SELECT m.id, m.conversation_id, m.sender_uid, m.content, m.created_at, p.username
+    SELECT m.id, m.conversation_id, m.sender_uid, m.content, m.created_at, p.username, COALESCE(m.sender_device_id, 1)
     FROM messages m
     JOIN conversation_members cm ON m.conversation_id = cm.conversation_id
     JOIN profiles p ON m.sender_uid = p.firebase_uid
@@ -1367,21 +1434,22 @@ func getMissedMessagesHandler(w http.ResponseWriter, r *http.Request) {
         var msg Message
         var username string
         var contentBytes []byte
-err :=  rows.Scan(&msg.ID, &msg.ConversationID, &msg.SenderUID, &contentBytes, &msg.Timestamp, &username)
+        var senderDeviceID int
+        err := rows.Scan(&msg.ID, &msg.ConversationID, &msg.SenderUID, &contentBytes, &msg.Timestamp, &username, &senderDeviceID)
         if err != nil {
             continue
         }
 
         messages = append(messages, map[string]interface{}{
-    "message_id":      msg.ID,
-    "conversation_id": msg.ConversationID,
-    "sender_uid":      msg.SenderUID,
-    "sender_username": username,
-    "content_b64":     base64.StdEncoding.EncodeToString(contentBytes),
-    "created_at":      msg.Timestamp.UTC().Format(time.RFC3339),
-    "sender_device_id": 1,
-})
-	}
+            "message_id":      msg.ID,
+            "conversation_id": msg.ConversationID,
+            "sender_uid":      msg.SenderUID,
+            "sender_username": username,
+            "content_b64":     base64.StdEncoding.EncodeToString(contentBytes),
+            "created_at":      msg.Timestamp.UTC().Format(time.RFC3339),
+            "sender_device_id": senderDeviceID,
+        })
+    }
 
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1761,7 +1829,8 @@ func deliverOfflineMessages(client *Client) {
                    AND omq2.message_id = omq.message_id
                    AND omq2.message_type = 'message_deleted'
                    AND omq2.delivered = false
-               ) as has_deletion
+               ) as has_deletion,
+               COALESCE(m.sender_device_id, 1) as sender_device_id
         FROM offline_message_queue omq
         LEFT JOIN profiles p ON p.firebase_uid = omq.sender_uid
         LEFT JOIN messages m ON m.id = omq.message_id
@@ -1780,8 +1849,6 @@ func deliverOfflineMessages(client *Client) {
     var deliveredIDs []int
     messageCount := 0
 
-	deviceIdCache := make(map[string]int)
-
 for rows.Next() {
     var queueID int
     var messageType sql.NullString
@@ -1797,10 +1864,11 @@ for rows.Next() {
     var attachmentType sql.NullString
     var isGroup bool
     var hasDeletion bool
+    var msgSenderDeviceID int
 
     err := rows.Scan(&queueID, &messageType, &messageData,
                     &messageID, &senderUID, &conversationID, &encryptedContent,
-                    &sessionContext, &createdAt, &senderUsername, &attachmentID, &attachmentType, &isGroup, &hasDeletion)
+                    &sessionContext, &createdAt, &senderUsername, &attachmentID, &attachmentType, &isGroup, &hasDeletion, &msgSenderDeviceID)
     if err != nil {
         log.Printf("deliverOfflineMessages: scan error: %v", err)
         continue
@@ -1827,23 +1895,13 @@ for rows.Next() {
         log.Printf("Delivering offline %s notification to %s", messageType.String, client.uid)
     } else if senderUID.Valid {
         // Regular message
-        actualSenderDeviceId, exists := deviceIdCache[senderUID.String]
-        if !exists {
-            err = db.QueryRow("SELECT device_id FROM devices WHERE firebase_uid = $1 LIMIT 1", senderUID.String).Scan(&actualSenderDeviceId)
-            if err != nil {
-                log.Printf("Could not get sender device ID for %s: %v", senderUID.String, err)
-                actualSenderDeviceId = 1
-            }
-            deviceIdCache[senderUID.String] = actualSenderDeviceId
-        }
-
         wsMessage = map[string]interface{}{
             "type":               "new_message",
             "message_id":         int(messageID.Int64),
             "conversation_id":    int(conversationID.Int64),
             "sender_uid":         senderUID.String,
             "sender_username":    senderUsername.String,
-            "sender_device_id":   actualSenderDeviceId,
+            "sender_device_id":   msgSenderDeviceID,
             "content_b64":        base64.StdEncoding.EncodeToString(encryptedContent),
             "created_at":         createdAt.UTC().Format(time.RFC3339),
             "from_offline_queue": true,
@@ -1886,24 +1944,24 @@ for rows.Next() {
 }
 
     // Mark delivered messages as processed
-// DISABLED:     if len(deliveredIDs) > 0 {
-// DISABLED:         placeholders := make([]string, len(deliveredIDs))
-// DISABLED:         args := make([]interface{}, len(deliveredIDs))
-// DISABLED:         for i, id := range deliveredIDs {
-// DISABLED:             placeholders[i] = "$" + strconv.Itoa(i+1)
-// DISABLED:             args[i] = id
-// DISABLED:         }
-// DISABLED: 
-// DISABLED:         updateQuery := `UPDATE offline_message_queue SET delivered = true, delivered_at = NOW() 
-// DISABLED:                        WHERE id IN (` + strings.Join(placeholders, ",") + `)`
-// DISABLED:         
-// DISABLED:         _, err = db.Exec(updateQuery, args...)
-// DISABLED:         if err != nil {
-// DISABLED:             log.Printf("deliverOfflineMessages: failed to mark as delivered: %v", err)
-// DISABLED:         } else {
-// DISABLED:             log.Printf("Delivered %d offline messages to %s", messageCount, client.uid)
-// DISABLED:         }
-// DISABLED:     }
+    if len(deliveredIDs) > 0 {
+        placeholders := make([]string, len(deliveredIDs))
+        args := make([]interface{}, len(deliveredIDs))
+        for i, id := range deliveredIDs {
+            placeholders[i] = "$" + strconv.Itoa(i+1)
+            args[i] = id
+        }
+
+        updateQuery := `UPDATE offline_message_queue SET delivered = true, delivered_at = NOW() 
+                       WHERE id IN (` + strings.Join(placeholders, ",") + `)`
+        
+        _, err = db.Exec(updateQuery, args...)
+        if err != nil {
+            log.Printf("deliverOfflineMessages: failed to mark as delivered: %v", err)
+        } else {
+            log.Printf("Delivered %d offline messages to %s and marked delivered in queue", messageCount, client.uid)
+        }
+    }
 }
 
 func getPreKeyCountHandler(w http.ResponseWriter, r *http.Request) {

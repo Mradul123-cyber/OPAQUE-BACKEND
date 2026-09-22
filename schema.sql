@@ -37,8 +37,17 @@ CREATE TABLE IF NOT EXISTS profiles (
     profile_avatar_url TEXT,
     display_name VARCHAR(100),
     avatar_privacy VARCHAR(20) NOT NULL DEFAULT 'everyone' CHECK (avatar_privacy IN ('everyone', 'contacts', 'nobody')),
+    message_privacy VARCHAR(20) NOT NULL DEFAULT 'everyone' CHECK (message_privacy IN ('everyone', 'friends', 'nobody')),
+    last_seen_privacy VARCHAR(20) NOT NULL DEFAULT 'everyone' CHECK (last_seen_privacy IN ('everyone', 'friends', 'nobody')),
+    two_factor_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    two_factor_pin_hash TEXT,
+    two_factor_updated_at TIMESTAMPTZ,
+    contact_email TEXT,
+    contact_email_verified BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_contact_email ON profiles (contact_email) WHERE contact_email IS NOT NULL;
 
 -- Devices: User devices for multi-device support
 CREATE TABLE IF NOT EXISTS devices (
@@ -65,6 +74,10 @@ CREATE TABLE IF NOT EXISTS conversations (
     current_key_generation INTEGER DEFAULT 1,
     last_rotation_at TIMESTAMP DEFAULT NOW(),
     message_count_since_rotation INTEGER DEFAULT 0,
+    edit_group_info_permission VARCHAR(20) DEFAULT 'all_members',
+    send_messages_permission VARCHAR(20) DEFAULT 'all_members',
+    add_members_permission VARCHAR(20) DEFAULT 'all_members',
+    require_admin_approval BOOLEAN DEFAULT false,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -76,6 +89,21 @@ CREATE TABLE IF NOT EXISTS conversation_members (
     joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (conversation_id, profile_uid)
 );
+
+-- Group Join Requests: Pending requests to join private groups
+CREATE TABLE IF NOT EXISTS group_join_requests (
+    id SERIAL PRIMARY KEY,
+    conversation_id INT REFERENCES conversations(id) ON DELETE CASCADE,
+    profile_uid VARCHAR(128) REFERENCES profiles(firebase_uid) ON DELETE CASCADE,
+    requested_by_uid VARCHAR(128) REFERENCES profiles(firebase_uid) ON DELETE CASCADE,
+    status VARCHAR(20) DEFAULT 'pending',
+    created_at TIMESTAMP DEFAULT NOW(),
+    reviewed_by_uid VARCHAR(128),
+    reviewed_at TIMESTAMP,
+    UNIQUE(conversation_id, profile_uid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_group_join_requests_conv ON group_join_requests(conversation_id, status);
 
 -- Friendships: Friend relationships and requests
 CREATE TABLE IF NOT EXISTS friendships (
@@ -172,6 +200,8 @@ CREATE TABLE IF NOT EXISTS messages (
     content BYTEA NOT NULL, -- Binary encrypted ciphertext
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     deleted_for_everyone BOOLEAN DEFAULT FALSE,
+    is_edited BOOLEAN DEFAULT FALSE,
+    edited_at TIMESTAMP WITH TIME ZONE NULL,
     message_type TEXT DEFAULT 'chat', -- 'chat', 'system', 'ephemeral'
     ephemeral_expires_at TIMESTAMPTZ,
     metadata JSONB,

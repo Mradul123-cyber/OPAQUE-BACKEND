@@ -47,68 +47,104 @@ func sendPushNotification(fcmToken string, title string, body string, data map[s
 }
 
 // Send new message notification to offline users
-// Send new message notification to offline users
-// Send new message notification to offline users
-func sendNewMessageNotification(recipientUID string, senderUID string, senderUsername string, messageContent string, conversationID int, messageID int) {
-    // Get FCM token for recipient
-    var fcmToken string
-    err := db.QueryRow(`
-        SELECT fcm_token FROM devices 
-        WHERE firebase_uid = $1 AND fcm_token IS NOT NULL AND fcm_token != ''
-        ORDER BY last_seen_at DESC LIMIT 1
-    `, recipientUID).Scan(&fcmToken)
+func sendNewMessageNotification(recipientUID string, senderUID string, senderUsername string, messageContent string, conversationID int, messageID int, contentB64 string, senderDeviceID int, messageType string, isGroup bool) {
+	if fcmClient == nil {
+		log.Printf("FCM client not initialized, skipping notification to %s", recipientUID)
+		return
+	}
 
-    if err != nil {
-        log.Printf("No FCM token found for user %s: %v", recipientUID, err)
-        return
-    }
+	// Get all FCM tokens for recipient's devices (multi-device support)
+	rows, err := db.Query(`
+		SELECT device_id, fcm_token FROM devices 
+		WHERE firebase_uid = $1 AND fcm_token IS NOT NULL AND fcm_token != ''
+		ORDER BY last_seen_at DESC
+	`, recipientUID)
+	if err != nil {
+		log.Printf("Error querying FCM tokens for user %s: %v", recipientUID, err)
+		return
+	}
+	defer rows.Close()
 
-    // Prepare notification data
-    title := senderUsername
-    body := messageContent
-    if len(body) > 100 {
-        body = body[:97] + "..."
-    }
+	type devToken struct {
+		deviceID int
+		token    string
+	}
+	var targetDevices []devToken
+	for rows.Next() {
+		var dID int
+		var token string
+		if err := rows.Scan(&dID, &token); err == nil && token != "" {
+			targetDevices = append(targetDevices, devToken{deviceID: dID, token: token})
+		}
+	}
 
-    // FCM data payload (all values must be strings) - UPDATED WITH SENDER/RECIPIENT UIDs
-    data := map[string]string{
-        "type":            "new_message",
-        "conversation_id": fmt.Sprintf("%d", conversationID),
-        "message_id":      fmt.Sprintf("%d", messageID),
-        "sender_username": senderUsername,
-        "sender_uid":      senderUID,     // ADDED: For quick reply encryption
-        "recipient_uid":   recipientUID,  // ADDED: For quick reply encryption  
-        "click_action":    "FLUTTER_NOTIFICATION_CLICK",
-    }
+	if len(targetDevices) == 0 {
+		log.Printf("No active FCM tokens found for user %s", recipientUID)
+		return
+	}
 
-    // Send the notification
-    if err := sendPushNotification(fcmToken, title, body, data); err != nil {
-        log.Printf("Failed to send push notification to %s: %v", recipientUID, err)
-    } else {
-        log.Printf("Push notification sent to %s for message %d", recipientUID, messageID)
-        
-        // Mark message as delivered since notification was sent successfully
-        _, err := db.Exec(`
-            UPDATE message_status 
-            SET delivered_at = NOW() 
-            WHERE message_id = $1 AND recipient_uid = $2 AND delivered_at IS NULL
-        `, messageID, recipientUID)
-        
-        if err != nil {
-            log.Printf("Failed to update delivered status for message %d: %v", messageID, err)
-        } else {
-            log.Printf("Message %d marked as delivered for user %s", messageID, recipientUID)
-            
-            // Broadcast delivered status to sender using your existing function
-            statusMessage := map[string]interface{}{
-                "type":            "message_status",
-                "message_id":      messageID,
-                "status":          "delivered",
-                "conversation_id": conversationID,
-            }
-            broadcastToUser(globalHub, senderUID, statusMessage)
-        }
-    }
+	// Prepare notification data
+	title := senderUsername
+	body := messageContent
+	if body == "" {
+		body = "You have a new message"
+	}
+	if len(body) > 100 {
+		body = body[:97] + "..."
+	}
+
+	// FCM data payload (all values must be strings) - includes content_b64 for client E2EE decryption
+	data := map[string]string{
+		"type":             "new_message",
+		"conversation_id":  fmt.Sprintf("%d", conversationID),
+		"message_id":       fmt.Sprintf("%d", messageID),
+		"sender_username":  senderUsername,
+		"sender_uid":       senderUID,
+		"recipient_uid":    recipientUID,
+		"content_b64":      contentB64,
+		"sender_device_id": fmt.Sprintf("%d", senderDeviceID),
+		"message_type":     messageType,
+		"is_group":         fmt.Sprintf("%t", isGroup),
+		"click_action":     "FLUTTER_NOTIFICATION_CLICK",
+	}
+
+	sentAtLeastOnce := false
+	for _, dev := range targetDevices {
+		if err := sendPushNotification(dev.token, title, body, data); err != nil {
+			log.Printf("Failed to send push notification to %s (device %d): %v", recipientUID, dev.deviceID, err)
+			if messaging.IsRegistrationTokenNotRegistered(err) {
+				log.Printf("FCM token unregistered for user %s device %d, clearing...", recipientUID, dev.deviceID)
+				db.Exec(`UPDATE devices SET fcm_token = NULL WHERE firebase_uid = $1 AND device_id = $2`, recipientUID, dev.deviceID)
+			}
+		} else {
+			sentAtLeastOnce = true
+			log.Printf("Push notification sent to %s (device %d) for message %d", recipientUID, dev.deviceID, messageID)
+		}
+	}
+
+	if sentAtLeastOnce {
+		// Mark message as delivered since notification was sent successfully
+		_, err := db.Exec(`
+			UPDATE message_status 
+			SET delivered_at = NOW() 
+			WHERE message_id = $1 AND recipient_uid = $2 AND delivered_at IS NULL
+		`, messageID, recipientUID)
+
+		if err != nil {
+			log.Printf("Failed to update delivered status for message %d: %v", messageID, err)
+		} else {
+			log.Printf("Message %d marked as delivered for user %s", messageID, recipientUID)
+
+			// Broadcast delivered status to sender
+			statusMessage := map[string]interface{}{
+				"type":            "message_status",
+				"message_id":      messageID,
+				"status":          "delivered",
+				"conversation_id": conversationID,
+			}
+			broadcastToUser(globalHub, senderUID, statusMessage)
+		}
+	}
 }
 
 

@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"zarq-messenger/handlers"
@@ -26,6 +27,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
 	"github.com/lib/pq"
+	"golang.org/x/crypto/bcrypt"
 )
 
 var globalHub *Hub
@@ -132,6 +134,39 @@ func handleAuthError(w http.ResponseWriter, err error) {
 	sendJSONError(w, http.StatusUnauthorized, string(AuthErrInvalidToken), "Invalid authentication credentials")
 }
 
+type userRecordCacheEntry struct {
+	record    *auth.UserRecord
+	expiresAt time.Time
+}
+
+var (
+	userRecordCache   = make(map[string]userRecordCacheEntry)
+	userRecordCacheMu sync.RWMutex
+)
+
+func getCachedUserRecord(ctx context.Context, uid string) (*auth.UserRecord, error) {
+	userRecordCacheMu.RLock()
+	entry, ok := userRecordCache[uid]
+	userRecordCacheMu.RUnlock()
+	if ok && time.Now().Before(entry.expiresAt) {
+		return entry.record, nil
+	}
+
+	record, err := firebaseAuth.GetUser(ctx, uid)
+	if err != nil {
+		return nil, err
+	}
+
+	userRecordCacheMu.Lock()
+	userRecordCache[uid] = userRecordCacheEntry{
+		record:    record,
+		expiresAt: time.Now().Add(60 * time.Second),
+	}
+	userRecordCacheMu.Unlock()
+
+	return record, nil
+}
+
 // verifyFirebaseTokenStrict verifies the Firebase ID token with strict revocation and disabled checking.
 // It fails closed: revoked tokens are rejected immediately. Infrastructure outages return service_unavailable (503).
 func verifyFirebaseTokenStrict(ctx context.Context, tokenStr string) (*auth.Token, *auth.UserRecord, error) {
@@ -185,7 +220,7 @@ func verifyFirebaseTokenStrict(ctx context.Context, tokenStr string) (*auth.Toke
 		}
 	}
 
-	userRecord, err := firebaseAuth.GetUser(ctx, token.UID)
+	userRecord, err := getCachedUserRecord(ctx, token.UID)
 	if err != nil {
 		if auth.IsUserNotFound(err) {
 			return nil, nil, &AuthError{
@@ -509,9 +544,18 @@ func createProfileHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Prepare contact_email from verified identity if present
+	var contactEmail *string
+	var contactEmailVerified bool
+	if identity.Email != "" {
+		trimmed := strings.ToLower(strings.TrimSpace(identity.Email))
+		contactEmail = &trimmed
+		contactEmailVerified = identity.EmailVerified
+	}
+
 	// Perform insert
-	insertQuery := `INSERT INTO profiles (firebase_uid, username, phone_hash, display_name) VALUES ($1, $2, $3, $4)`
-	_, err = tx.ExecContext(r.Context(), insertQuery, identity.UID, username, phoneHash, displayName)
+	insertQuery := `INSERT INTO profiles (firebase_uid, username, phone_hash, display_name, contact_email, contact_email_verified) VALUES ($1, $2, $3, $4, $5, $6)`
+	_, err = tx.ExecContext(r.Context(), insertQuery, identity.UID, username, phoneHash, displayName, contactEmail, contactEmailVerified)
 	if err != nil {
 		_ = tx.Rollback()
 		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
@@ -532,6 +576,9 @@ func createProfileHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			} else if strings.Contains(pqErr.Constraint, "phone") {
 				sendJSONError(w, http.StatusConflict, "phone_taken", "This phone number was just registered by another user")
+				return
+			} else if strings.Contains(pqErr.Constraint, "contact_email") || strings.Contains(pqErr.Constraint, "email") {
+				sendJSONError(w, http.StatusConflict, "email_taken", "This email address is already registered to another account")
 				return
 			}
 		}
@@ -631,6 +678,24 @@ func validateAvatarPrivacy(setting string) (string, error) {
 	return s, nil
 }
 
+// validateMessagePrivacy ensures the setting is one of 'everyone', 'friends', or 'nobody'.
+func validateMessagePrivacy(setting string) (string, error) {
+	s := strings.ToLower(strings.TrimSpace(setting))
+	if s != "everyone" && s != "friends" && s != "nobody" {
+		return "", fmt.Errorf("message privacy must be 'everyone', 'friends', or 'nobody'")
+	}
+	return s, nil
+}
+
+// validateLastSeenPrivacy ensures the setting is one of 'everyone', 'friends', or 'nobody'.
+func validateLastSeenPrivacy(setting string) (string, error) {
+	s := strings.ToLower(strings.TrimSpace(setting))
+	if s != "everyone" && s != "friends" && s != "nobody" {
+		return "", fmt.Errorf("last seen privacy must be 'everyone', 'friends', or 'nobody'")
+	}
+	return s, nil
+}
+
 func updateAvatarPrivacyHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	token, _, err := getVerifiedToken(r)
@@ -666,6 +731,84 @@ func updateAvatarPrivacyHandler(w http.ResponseWriter, r *http.Request) {
 		"avatarPrivacy": setting,
 	})
 	log.Printf("Updated avatar privacy to %s for user %s", setting, uid)
+}
+
+func updateMessagePrivacyHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	token, _, err := getVerifiedToken(r)
+	if err != nil {
+		sendJSONError(w, http.StatusUnauthorized, "invalid_token", err.Error())
+		return
+	}
+	uid := token.UID
+
+	var payload struct {
+		MessagingPrivacy string `json:"messagingPrivacy"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		sendJSONError(w, http.StatusBadRequest, "invalid_body", "Invalid request body")
+		return
+	}
+
+	setting, err := validateMessagePrivacy(payload.MessagingPrivacy)
+	if err != nil {
+		sendJSONError(w, http.StatusBadRequest, "invalid_privacy_setting", err.Error())
+		return
+	}
+
+	_, err = db.Exec("UPDATE profiles SET message_privacy = $1 WHERE firebase_uid = $2", setting, uid)
+	if err != nil {
+		log.Printf("updateMessagePrivacyHandler: DB update failed for %s: %v", uid, err)
+		sendJSONError(w, http.StatusInternalServerError, "server_error", "Failed to update message privacy")
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":           "success",
+		"message":          "Message privacy updated successfully",
+		"messagingPrivacy": setting,
+	})
+	log.Printf("Updated message privacy to %s for user %s", setting, uid)
+}
+
+func updateLastSeenPrivacyHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	token, _, err := getVerifiedToken(r)
+	if err != nil {
+		sendJSONError(w, http.StatusUnauthorized, "invalid_token", err.Error())
+		return
+	}
+	uid := token.UID
+
+	var payload struct {
+		LastSeenPrivacy string `json:"lastSeenPrivacy"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		sendJSONError(w, http.StatusBadRequest, "invalid_body", "Invalid request body")
+		return
+	}
+
+	setting, err := validateLastSeenPrivacy(payload.LastSeenPrivacy)
+	if err != nil {
+		sendJSONError(w, http.StatusBadRequest, "invalid_privacy_setting", err.Error())
+		return
+	}
+
+	_, err = db.Exec("UPDATE profiles SET last_seen_privacy = $1 WHERE firebase_uid = $2", setting, uid)
+	if err != nil {
+		log.Printf("updateLastSeenPrivacyHandler: DB update failed for %s: %v", uid, err)
+		sendJSONError(w, http.StatusInternalServerError, "server_error", "Failed to update last seen privacy")
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":          "success",
+		"message":         "Last seen privacy updated successfully",
+		"lastSeenPrivacy": setting,
+	})
+	log.Printf("Updated last seen privacy to %s for user %s", setting, uid)
 }
 
 func updateDisplayNameHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
@@ -766,6 +909,288 @@ func updateUserDisplayNameHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"message": "Display name updated successfully"})
 	log.Printf("Display name updated for UID %s to '%s'", uid, displayName)
+}
+
+// updateUsernameHandler updates the user's username after verifying uniqueness and formatting
+func updateUsernameHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	token, _, err := getVerifiedToken(r)
+	if err != nil {
+		sendJSONError(w, http.StatusUnauthorized, "unauthorized", err.Error())
+		return
+	}
+	uid := token.UID
+
+	var payload struct {
+		Username string `json:"username"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		sendJSONError(w, http.StatusBadRequest, "invalid_body", "Invalid request body")
+		return
+	}
+
+	newUsername := strings.TrimSpace(payload.Username)
+	if err := validateUsername(newUsername); err != nil {
+		sendJSONError(w, http.StatusBadRequest, "invalid_username", err.Error())
+		return
+	}
+
+	// Check if already taken by someone else
+	var existsUID string
+	err = db.QueryRow("SELECT firebase_uid FROM profiles WHERE LOWER(username) = LOWER($1)", newUsername).Scan(&existsUID)
+	if err == nil {
+		if existsUID == uid {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":   "success",
+				"username": newUsername,
+				"message":  "Username unchanged",
+			})
+			return
+		}
+		sendJSONError(w, http.StatusConflict, "username_taken", "Username is already taken")
+		return
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("updateUsernameHandler: check conflict error: %v", err)
+		sendJSONError(w, http.StatusInternalServerError, "server_error", "Database error checking username")
+		return
+	}
+
+	// Update username
+	_, err = db.Exec("UPDATE profiles SET username = $1 WHERE firebase_uid = $2", newUsername, uid)
+	if err != nil {
+		log.Printf("updateUsernameHandler: update error: %v", err)
+		sendJSONError(w, http.StatusInternalServerError, "server_error", "Failed to update username")
+		return
+	}
+
+	// Notify hub of username change
+	if hub != nil {
+		select {
+		case hub.updateUsername <- map[string]string{"uid": uid, "username": newUsername}:
+		default:
+		}
+	}
+
+	log.Printf("Username updated for %s to '%s'", uid, newUsername)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":   "success",
+		"username": newUsername,
+	})
+}
+
+// hashPhoneNumber computes the SHA-256 hex digest of a phone number
+func hashPhoneNumber(phone string) string {
+	hasher := sha256.New()
+	hasher.Write([]byte(phone))
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+// updatePhoneHandler updates the user's phone hash when phone is changed or linked
+func updatePhoneHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	identity, err := getTrustedIdentity(r)
+	if err != nil {
+		sendJSONError(w, http.StatusUnauthorized, "unauthorized", err.Error())
+		return
+	}
+	uid := identity.UID
+
+	if identity.PhoneNumber == "" {
+		sendJSONError(w, http.StatusBadRequest, "no_phone", "No phone number linked to this Firebase account")
+		return
+	}
+
+	phoneHash := hashPhoneNumber(identity.PhoneNumber)
+
+	// Check if already registered to another user
+	var existingUID string
+	err = db.QueryRow("SELECT firebase_uid FROM profiles WHERE phone_hash = $1", phoneHash).Scan(&existingUID)
+	if err == nil && existingUID != uid {
+		sendJSONError(w, http.StatusConflict, "phone_taken", "This phone number is already registered to another account")
+		return
+	}
+
+	_, err = db.Exec("UPDATE profiles SET phone_hash = $1 WHERE firebase_uid = $2", phoneHash, uid)
+	if err != nil {
+		log.Printf("updatePhoneHandler: update error: %v", err)
+		sendJSONError(w, http.StatusInternalServerError, "server_error", "Failed to update phone number")
+		return
+	}
+
+	log.Printf("Phone hash updated for %s", uid)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":     "success",
+		"has_phone":  true,
+		"phone_hash": phoneHash,
+	})
+}
+
+var pinRegex = regexp.MustCompile(`^[0-9]{6}$`)
+
+// get2FAStatusHandler returns whether 2FA is enabled for the authenticated user
+func get2FAStatusHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	token, _, err := getVerifiedToken(r)
+	if err != nil {
+		sendJSONError(w, http.StatusUnauthorized, "unauthorized", err.Error())
+		return
+	}
+
+	var enabled bool
+	err = db.QueryRow("SELECT COALESCE(two_factor_enabled, false) FROM profiles WHERE firebase_uid = $1", token.UID).Scan(&enabled)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			json.NewEncoder(w).Encode(map[string]interface{}{"two_factor_enabled": false})
+			return
+		}
+		log.Printf("get2FAStatusHandler: DB error: %v", err)
+		sendJSONError(w, http.StatusInternalServerError, "server_error", "Database error")
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"two_factor_enabled": enabled,
+	})
+}
+
+// setup2FAHandler sets up, updates, or disables the 6-digit Security PIN
+func setup2FAHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	token, _, err := getVerifiedToken(r)
+	if err != nil {
+		sendJSONError(w, http.StatusUnauthorized, "unauthorized", err.Error())
+		return
+	}
+	uid := token.UID
+
+	var req struct {
+		Enabled    bool   `json:"enabled"`
+		PIN        string `json:"pin"`
+		CurrentPIN string `json:"current_pin"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		sendJSONError(w, http.StatusBadRequest, "invalid_body", "Invalid request body")
+		return
+	}
+
+	// Fetch existing status and hash
+	var currentEnabled bool
+	var currentHash sql.NullString
+	err = db.QueryRow("SELECT COALESCE(two_factor_enabled, false), two_factor_pin_hash FROM profiles WHERE firebase_uid = $1", uid).Scan(&currentEnabled, &currentHash)
+	if err != nil {
+		log.Printf("setup2FAHandler: DB error: %v", err)
+		sendJSONError(w, http.StatusInternalServerError, "server_error", "Database error")
+		return
+	}
+
+	// If already enabled, verify current_pin before changing or disabling
+	if currentEnabled && currentHash.Valid && currentHash.String != "" {
+		if req.CurrentPIN == "" {
+			sendJSONError(w, http.StatusBadRequest, "current_pin_required", "Current PIN is required to make changes")
+			return
+		}
+		if err := bcrypt.CompareHashAndPassword([]byte(currentHash.String), []byte(req.CurrentPIN)); err != nil {
+			sendJSONError(w, http.StatusUnauthorized, "incorrect_pin", "Current PIN is incorrect")
+			return
+		}
+	}
+
+	if req.Enabled {
+		// Enabling or updating PIN: PIN must be 6 digits
+		if !pinRegex.MatchString(req.PIN) {
+			sendJSONError(w, http.StatusBadRequest, "invalid_pin", "PIN must be exactly 6 numeric digits")
+			return
+		}
+
+		hashedBytes, err := bcrypt.GenerateFromPassword([]byte(req.PIN), 12)
+		if err != nil {
+			log.Printf("setup2FAHandler: bcrypt error: %v", err)
+			sendJSONError(w, http.StatusInternalServerError, "server_error", "Failed to hash PIN")
+			return
+		}
+
+		_, err = db.Exec("UPDATE profiles SET two_factor_enabled = true, two_factor_pin_hash = $1, two_factor_updated_at = NOW() WHERE firebase_uid = $2", string(hashedBytes), uid)
+		if err != nil {
+			log.Printf("setup2FAHandler: update error: %v", err)
+			sendJSONError(w, http.StatusInternalServerError, "server_error", "Failed to update 2FA")
+			return
+		}
+
+		log.Printf("2FA PIN enabled for %s", uid)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":             "success",
+			"two_factor_enabled": true,
+			"message":            "Two-Step Verification PIN activated",
+		})
+	} else {
+		// Disabling PIN
+		_, err = db.Exec("UPDATE profiles SET two_factor_enabled = false, two_factor_pin_hash = NULL, two_factor_updated_at = NOW() WHERE firebase_uid = $1", uid)
+		if err != nil {
+			log.Printf("setup2FAHandler: disable error: %v", err)
+			sendJSONError(w, http.StatusInternalServerError, "server_error", "Failed to disable 2FA")
+			return
+		}
+
+		log.Printf("2FA PIN disabled for %s", uid)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":             "success",
+			"two_factor_enabled": false,
+			"message":            "Two-Step Verification PIN disabled",
+		})
+	}
+}
+
+// verify2FAHandler verifies the 6-digit PIN during login on a new device
+func verify2FAHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	token, _, err := getVerifiedToken(r)
+	if err != nil {
+		sendJSONError(w, http.StatusUnauthorized, "unauthorized", err.Error())
+		return
+	}
+	uid := token.UID
+
+	var req struct {
+		PIN string `json:"pin"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		sendJSONError(w, http.StatusBadRequest, "invalid_body", "Invalid request body")
+		return
+	}
+
+	var enabled bool
+	var pinHash sql.NullString
+	err = db.QueryRow("SELECT COALESCE(two_factor_enabled, false), two_factor_pin_hash FROM profiles WHERE firebase_uid = $1", uid).Scan(&enabled, &pinHash)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			sendJSONError(w, http.StatusNotFound, "profile_not_found", "Profile not found")
+			return
+		}
+		log.Printf("verify2FAHandler: DB error: %v", err)
+		sendJSONError(w, http.StatusInternalServerError, "server_error", "Database error")
+		return
+	}
+
+	// If 2FA is not enabled on this account, consider it valid
+	if !enabled || !pinHash.Valid || pinHash.String == "" {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"valid":              true,
+			"two_factor_enabled": false,
+		})
+		return
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(pinHash.String), []byte(req.PIN)); err != nil {
+		sendJSONError(w, http.StatusUnauthorized, "invalid_pin", "Incorrect 6-digit PIN")
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"valid":              true,
+		"two_factor_enabled": true,
+	})
 }
 
 func findFriendsHandler(w http.ResponseWriter, r *http.Request) {
@@ -1629,6 +2054,7 @@ func startOrGetConversationHandler(w http.ResponseWriter, r *http.Request) {
 	var targetUserUID string
 	err = db.QueryRow("SELECT firebase_uid FROM profiles WHERE username = $1", targetUsername).Scan(&targetUserUID)
 	if err != nil { http.Error(w, "Target user not found", http.StatusNotFound); return }
+
 	var conversationID int
 	query := `
 		SELECT cm1.conversation_id FROM conversation_members cm1
@@ -1637,7 +2063,53 @@ func startOrGetConversationHandler(w http.ResponseWriter, r *http.Request) {
 		WHERE cm1.profile_uid = $1 AND cm2.profile_uid = $2 AND c.is_group = false
 	`
 	err = db.QueryRow(query, currentUserUID, targetUserUID).Scan(&conversationID)
-	if err == nil {
+	hasExistingConversation := (err == nil)
+
+	// If conversation already exists and target user has sent a message in it,
+	// target initiated/participated, so allow returning the conversation immediately.
+	if hasExistingConversation {
+		var targetSentMsg bool
+		db.QueryRow(`
+			SELECT EXISTS(
+				SELECT 1 FROM messages 
+				WHERE conversation_id = $1 AND sender_uid = $2
+			)
+		`, conversationID, targetUserUID).Scan(&targetSentMsg)
+		if targetSentMsg {
+			log.Printf("Found existing active conversation (%d) where target %s already sent messages, allowing", conversationID, targetUserUID)
+			json.NewEncoder(w).Encode(map[string]int{"conversationId": conversationID})
+			return
+		}
+	}
+
+	// Privacy gate: check if target allows new messages from this user
+	var msgPrivacy string
+	if err := db.QueryRow("SELECT COALESCE(message_privacy, 'everyone') FROM profiles WHERE firebase_uid = $1", targetUserUID).Scan(&msgPrivacy); err != nil {
+		msgPrivacy = "everyone" // default if query fails
+	}
+
+	if msgPrivacy == "nobody" {
+		w.Header().Set("Content-Type", "application/json")
+		sendJSONError(w, http.StatusForbidden, "messaging_restricted", "This user is not accepting new messages")
+		return
+	}
+
+	if msgPrivacy == "friends" {
+		// Check accepted friendship (user_a_uid is always lexicographically smaller)
+		userA, userB := currentUserUID, targetUserUID
+		if userA > userB {
+			userA, userB = userB, userA
+		}
+		var friendshipExists bool
+		db.QueryRow(`SELECT EXISTS(SELECT 1 FROM friendships WHERE user_a_uid=$1 AND user_b_uid=$2 AND status='accepted')`, userA, userB).Scan(&friendshipExists)
+		if !friendshipExists {
+			w.Header().Set("Content-Type", "application/json")
+			sendJSONError(w, http.StatusForbidden, "not_friends", "This user only accepts messages from friends")
+			return
+		}
+	}
+
+	if hasExistingConversation {
 		log.Printf("Found existing conversation (%d) between %s and %s", conversationID, currentUserUID, targetUserUID)
 		json.NewEncoder(w).Encode(map[string]int{"conversationId": conversationID})
 		return
@@ -1748,7 +2220,15 @@ func getMyProfileHandler(db *sql.DB) http.HandlerFunc {
 		var displayName sql.NullString
 		var phoneHash sql.NullString
 		var avatarPrivacy sql.NullString
-		err = db.QueryRowContext(r.Context(), "SELECT username, profile_avatar_url, display_name, phone_hash, avatar_privacy FROM profiles WHERE firebase_uid = $1", uid).Scan(&username, &profileAvatarURL, &displayName, &phoneHash, &avatarPrivacy)
+		var twoFactorEnabled bool
+		var contactEmail sql.NullString
+		var contactEmailVerified bool
+		var messagingPrivacy sql.NullString
+		var lastSeenPrivacy sql.NullString
+		err = db.QueryRowContext(r.Context(),
+			"SELECT username, profile_avatar_url, display_name, phone_hash, avatar_privacy, COALESCE(two_factor_enabled, false), contact_email, COALESCE(contact_email_verified, false), message_privacy, last_seen_privacy FROM profiles WHERE firebase_uid = $1",
+			uid,
+		).Scan(&username, &profileAvatarURL, &displayName, &phoneHash, &avatarPrivacy, &twoFactorEnabled, &contactEmail, &contactEmailVerified, &messagingPrivacy, &lastSeenPrivacy)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				// Distinguish 404 profile_not_found from 500 server_error so client knows profile hasn't been created
@@ -1765,17 +2245,47 @@ func getMyProfileHandler(db *sql.DB) http.HandlerFunc {
 			privacy = avatarPrivacy.String
 		}
 
+		// Auto-heal: If profile exists but contact_email is null/empty in DB, and the Firebase token has an email (e.g. from Google Sign-In)
+		// populate contact_email so it is reserved and cannot be claimed by other accounts
+		if (!contactEmail.Valid || contactEmail.String == "") && token.Claims != nil && token.Claims["email"] != nil {
+			claimEmail, _ := token.Claims["email"].(string)
+			claimEmail = strings.ToLower(strings.TrimSpace(claimEmail))
+			if claimEmail != "" {
+				var conflictUID string
+				_ = db.QueryRowContext(r.Context(), "SELECT firebase_uid FROM profiles WHERE LOWER(contact_email) = $1 AND firebase_uid != $2 LIMIT 1", claimEmail, uid).Scan(&conflictUID)
+				if conflictUID == "" {
+					_, _ = db.ExecContext(r.Context(), "UPDATE profiles SET contact_email = $1, contact_email_verified = true WHERE firebase_uid = $2 AND (contact_email IS NULL OR contact_email = '')", claimEmail, uid)
+					contactEmail = sql.NullString{String: claimEmail, Valid: true}
+					contactEmailVerified = true
+				}
+			}
+		}
+
+		msgPrivacy := "everyone"
+		if messagingPrivacy.Valid && messagingPrivacy.String != "" {
+			msgPrivacy = messagingPrivacy.String
+		}
+		lsPrivacy := "everyone"
+		if lastSeenPrivacy.Valid && lastSeenPrivacy.String != "" {
+			lsPrivacy = lastSeenPrivacy.String
+		}
+
 		// Build response compatible with client expectations
 		response := map[string]interface{}{
-			"status":              "found",
-			"uid":                 uid,
-			"username":            username,
-			"display_name":        displayName.String,
-			"profile_picture_url": profileAvatarURL.String,
-			"avatarUrl":           profileAvatarURL.String,
-			"avatar_privacy":      privacy,
-			"avatarPrivacy":      privacy,
-			"has_phone":           phoneHash.Valid && phoneHash.String != "",
+			"status":                 "found",
+			"uid":                    uid,
+			"username":               username,
+			"display_name":           displayName.String,
+			"profile_picture_url":    profileAvatarURL.String,
+			"avatarUrl":              profileAvatarURL.String,
+			"avatar_privacy":         privacy,
+			"avatarPrivacy":         privacy,
+			"message_privacy":        msgPrivacy,
+			"last_seen_privacy":      lsPrivacy,
+			"has_phone":              phoneHash.Valid && phoneHash.String != "",
+			"two_factor_enabled":     twoFactorEnabled,
+			"contact_email":          contactEmail.String,
+			"contact_email_verified": contactEmailVerified,
 		}
 		if phoneHash.Valid && phoneHash.String != "" {
 			response["phone_hash"] = phoneHash.String
@@ -1784,6 +2294,243 @@ func getMyProfileHandler(db *sql.DB) http.HandlerFunc {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(response)
 	}
+}
+
+// confirmContactEmailHandler is called by the Flutter client after the user
+// has clicked the Firebase verification link.  It re-validates the token so we
+// can inspect the user's providerData server-side, then marks the email as
+// verified in the DB.
+//
+// POST /profile/contact-email/confirm
+// Body: { "contact_email": "user@example.com" }
+func confirmContactEmailHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	token, _, err := getVerifiedToken(r)
+	if err != nil {
+		handleAuthError(w, err)
+		return
+	}
+	uid := token.UID
+
+	var body struct {
+		ContactEmail string `json:"contact_email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ContactEmail == "" {
+		sendJSONError(w, http.StatusBadRequest, "bad_request", "contact_email is required")
+		return
+	}
+
+	email := strings.ToLower(strings.TrimSpace(body.ContactEmail))
+
+	// Verify uniqueness — no other profile may already own this contact email
+	var existing string
+	err = db.QueryRowContext(r.Context(),
+		"SELECT firebase_uid FROM profiles WHERE contact_email = $1 AND firebase_uid != $2 LIMIT 1",
+		email, uid,
+	).Scan(&existing)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("confirmContactEmail: DB error checking uniqueness: %v", err)
+		sendJSONError(w, http.StatusInternalServerError, "server_error", "Failed to verify email uniqueness")
+		return
+	}
+	if existing != "" {
+		sendJSONError(w, http.StatusConflict, "email_in_use", "This email is already linked to another account")
+		return
+	}
+
+	// Write the confirmed email to database
+	_, err = db.ExecContext(r.Context(),
+		"UPDATE profiles SET contact_email = $1, contact_email_verified = true WHERE firebase_uid = $2",
+		email, uid,
+	)
+	if err != nil {
+		log.Printf("confirmContactEmail: DB update error for %s: %v", uid, err)
+		sendJSONError(w, http.StatusInternalServerError, "server_error", "Failed to save contact email")
+		return
+	}
+
+	// Update Firebase Auth user record so Firebase Console & Auth identify the new email
+	var customToken string
+	if firebaseAuth != nil {
+		userRecord, getErr := firebaseAuth.GetUser(r.Context(), uid)
+		if getErr == nil && userRecord != nil && strings.ToLower(userRecord.Email) == email {
+			log.Printf("confirmContactEmail: Firebase Auth primary email already matches %s, skipping UpdateUser to preserve refresh tokens", email)
+		} else {
+			params := (&auth.UserToUpdate{}).Email(email).EmailVerified(true)
+			_, fbErr := firebaseAuth.UpdateUser(r.Context(), uid, params)
+			if fbErr != nil {
+				log.Printf("confirmContactEmail: Warning: Failed to update Firebase Auth user email for %s: %v", uid, fbErr)
+			} else {
+				log.Printf("confirmContactEmail: Firebase Auth primary email successfully updated for uid=%s to %s", uid, email)
+			}
+		}
+
+		if ct, ctErr := firebaseAuth.CustomToken(r.Context(), uid); ctErr == nil {
+			customToken = ct
+		} else {
+			log.Printf("confirmContactEmail: CustomToken generation error for %s: %v", uid, ctErr)
+		}
+	}
+
+	log.Printf("confirmContactEmail: contact_email confirmed for uid=%s email=%s", uid, email)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":       "ok",
+		"message":      "Contact email confirmed successfully",
+		"custom_token": customToken,
+	})
+}
+
+// deleteContactEmailHandler removes the contact_email from the profile.
+//
+// DELETE /profile/contact-email
+func deleteContactEmailHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	token, _, err := getVerifiedToken(r)
+	if err != nil {
+		handleAuthError(w, err)
+		return
+	}
+	_, err = db.ExecContext(r.Context(),
+		"UPDATE profiles SET contact_email = NULL, contact_email_verified = false WHERE firebase_uid = $1",
+		token.UID,
+	)
+	if err != nil {
+		sendJSONError(w, http.StatusInternalServerError, "server_error", "Failed to remove contact email")
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// checkEmailAvailabilityHandler checks if an email is already registered in Firebase or PostgreSQL.
+// POST /profiles/check-email
+// Body: { "email": "user@example.com" }
+func checkEmailAvailabilityHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	token, _, _ := getVerifiedToken(r)
+	callerUID := ""
+	if token != nil {
+		callerUID = token.UID
+	}
+
+	var body struct {
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Email == "" {
+		sendJSONError(w, http.StatusBadRequest, "bad_request", "email is required")
+		return
+	}
+
+	email := strings.ToLower(strings.TrimSpace(body.Email))
+	if !strings.Contains(email, "@") || !strings.Contains(email, ".") {
+		sendJSONError(w, http.StatusBadRequest, "invalid_email", "Invalid email format")
+		return
+	}
+
+	// 1. Check PostgreSQL profiles table
+	var existingUID string
+	err := db.QueryRowContext(r.Context(),
+		"SELECT firebase_uid FROM profiles WHERE LOWER(contact_email) = $1 AND firebase_uid != $2 LIMIT 1",
+		email, callerUID,
+	).Scan(&existingUID)
+	if err == nil && existingUID != "" {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"available": false,
+			"reason":    "This email address is already registered to another account",
+		})
+		return
+	}
+
+	// 2. Check Firebase Auth if initialized
+	if firebaseAuth != nil {
+		userRecord, err := firebaseAuth.GetUserByEmail(r.Context(), email)
+		if err == nil && userRecord != nil && userRecord.UID != callerUID {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"available": false,
+				"reason":    "This email address is already in use by another account",
+			})
+			return
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"available": true,
+	})
+}
+
+// checkPhoneAvailabilityHandler checks if a phone number is already registered in Firebase Auth or PostgreSQL.
+// POST /profiles/check-phone
+// Body: { "phone": "+1234567890" }
+func checkPhoneAvailabilityHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	token, _, _ := getVerifiedToken(r)
+	callerUID := ""
+	if token != nil {
+		callerUID = token.UID
+	}
+
+	var body struct {
+		Phone string `json:"phone"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Phone == "" {
+		sendJSONError(w, http.StatusBadRequest, "bad_request", "phone is required")
+		return
+	}
+
+	phone := strings.TrimSpace(body.Phone)
+	if !strings.HasPrefix(phone, "+") || len(phone) < 8 {
+		sendJSONError(w, http.StatusBadRequest, "invalid_phone", "Invalid phone number format")
+		return
+	}
+
+	// 1. Check PostgreSQL profiles table using phone_hash
+	phoneHash := hashPhoneNumber(phone)
+	var existingUID string
+	err := db.QueryRowContext(r.Context(),
+		"SELECT firebase_uid FROM profiles WHERE phone_hash = $1 AND firebase_uid != $2 LIMIT 1",
+		phoneHash, callerUID,
+	).Scan(&existingUID)
+	if err == nil && existingUID != "" {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"available": false,
+			"reason":    "This phone number is already registered to another account.",
+		})
+		return
+	}
+
+	// 2. Check Firebase Auth if initialized
+	if firebaseAuth != nil {
+		userRecord, err := firebaseAuth.GetUserByPhoneNumber(r.Context(), phone)
+		if err == nil && userRecord != nil && userRecord.UID != callerUID {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"available": false,
+				"reason":    "This phone number is already in use by another account.",
+			})
+			return
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"available": true,
+	})
 }
 
 // deleteAccountHandler permanently deletes a user account and all associated data
@@ -2180,6 +2927,7 @@ func editMessageHandler(hub *Hub, db *sql.DB) http.HandlerFunc {
 		var req struct {
 			ConversationID int    `json:"conversation_id"`
 			ContentB64     string `json:"content_b64"`
+			SenderDeviceID int    `json:"sender_device_id"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
@@ -2211,12 +2959,13 @@ func editMessageHandler(hub *Hub, db *sql.DB) http.HandlerFunc {
 		var conversationID int
 		var messageType string
 		var createdAt time.Time
+		var senderDeviceID int
 
 		err = db.QueryRow(`
-			SELECT sender_uid, conversation_id, message_type, created_at 
+			SELECT sender_uid, conversation_id, message_type, created_at, sender_device_id 
 			FROM messages 
 			WHERE id = $1
-		`, messageID).Scan(&senderUID, &conversationID, &messageType, &createdAt)
+		`, messageID).Scan(&senderUID, &conversationID, &messageType, &createdAt, &senderDeviceID)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				http.Error(w, "Message not found", http.StatusNotFound)
@@ -2225,6 +2974,10 @@ func editMessageHandler(hub *Hub, db *sql.DB) http.HandlerFunc {
 			log.Printf("DB error finding message for edit %d: %v", messageID, err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
+		}
+
+		if req.SenderDeviceID > 0 {
+			senderDeviceID = req.SenderDeviceID
 		}
 
 		// Security 1: Only the original sender can edit their message
@@ -2248,9 +3001,9 @@ func editMessageHandler(hub *Hub, db *sql.DB) http.HandlerFunc {
 		now := time.Now().UTC()
 		_, err = db.Exec(`
 			UPDATE messages 
-			SET content = $1, is_edited = TRUE, edited_at = $2 
-			WHERE id = $3
-		`, contentBytes, now, messageID)
+			SET content = $1, is_edited = TRUE, edited_at = $2, sender_device_id = $3 
+			WHERE id = $4
+		`, contentBytes, now, senderDeviceID, messageID)
 		if err != nil {
 			log.Printf("DB error updating edited message %d: %v", messageID, err)
 			http.Error(w, "Failed to update message", http.StatusInternalServerError)
@@ -2266,12 +3019,13 @@ func editMessageHandler(hub *Hub, db *sql.DB) http.HandlerFunc {
 
 		// Prepare real-time WebSocket broadcast payload
 		editPayload := map[string]interface{}{
-			"type":            "message_edited",
-			"message_id":      messageID,
-			"conversation_id": conversationID,
-			"sender_uid":      senderUID,
-			"content_b64":     req.ContentB64,
-			"edited_at":       now.Format(time.RFC3339),
+			"type":             "message_edited",
+			"message_id":       messageID,
+			"conversation_id":  conversationID,
+			"sender_uid":       senderUID,
+			"sender_device_id": senderDeviceID,
+			"content_b64":      req.ContentB64,
+			"edited_at":        now.Format(time.RFC3339),
 		}
 
 		// Broadcast to all conversation members
@@ -3278,6 +4032,14 @@ func initGroupPermissionsSchema(db *sql.DB) {
 		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS require_admin_approval BOOLEAN DEFAULT false`,
 		`ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_edited BOOLEAN DEFAULT false`,
 		`ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP WITH TIME ZONE NULL`,
+		`ALTER TABLE profiles ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN DEFAULT false`,
+		`ALTER TABLE profiles ADD COLUMN IF NOT EXISTS two_factor_pin_hash TEXT`,
+		`ALTER TABLE profiles ADD COLUMN IF NOT EXISTS two_factor_updated_at TIMESTAMP WITH TIME ZONE NULL`,
+		`ALTER TABLE profiles ADD COLUMN IF NOT EXISTS contact_email TEXT`,
+		`ALTER TABLE profiles ADD COLUMN IF NOT EXISTS contact_email_verified BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE profiles ADD COLUMN IF NOT EXISTS message_privacy VARCHAR(20) NOT NULL DEFAULT 'everyone'`,
+		`ALTER TABLE profiles ADD COLUMN IF NOT EXISTS last_seen_privacy VARCHAR(20) NOT NULL DEFAULT 'everyone'`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_contact_email ON profiles (contact_email) WHERE contact_email IS NOT NULL`,
 		`CREATE TABLE IF NOT EXISTS group_join_requests (
 			id SERIAL PRIMARY KEY,
 			conversation_id INT REFERENCES conversations(id) ON DELETE CASCADE,
@@ -4224,7 +4986,18 @@ func main() {
 
 	router.HandleFunc("/v1/devices/register", basicRateLimitMiddleware(deviceRegisterHandler))
 	router.HandleFunc("/v1/prekey_bundle", basicRateLimitMiddleware(getPrekeyBundleHandler))
-	router.HandleFunc("/v1/turn/credentials", handlers.GetTURNCredentials).Methods("GET", "OPTIONS") // Protected endpoint for TURN credentials
+	router.HandleFunc("/v1/turn/credentials", basicRateLimitMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		token, _, err := getVerifiedToken(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
+		handlers.GetTURNCredentialsForUser(w, r, token.UID)
+	})).Methods("GET", "OPTIONS")
 	router.HandleFunc("/v1/messages/send", basicRateLimitMiddleware(sendMessageHandler))
 	router.HandleFunc("/v1/messages/sync", basicRateLimitMiddleware(getMessagesHandler))
 	router.HandleFunc("/v1/messages/status", basicRateLimitMiddleware(updateMessageStatusHandler))
@@ -4247,10 +5020,23 @@ func main() {
 	router.HandleFunc("/profiles/create", RateLimitMiddleware(profileCreateLimiter, "create-profile")(createProfileHandler))
 	router.HandleFunc("/profile/avatar/update", http.HandlerFunc(updateAvatarHandler))
 	router.HandleFunc("/profile/privacy/avatar", http.HandlerFunc(updateAvatarPrivacyHandler))
+	router.HandleFunc("/profile/privacy/message", http.HandlerFunc(updateMessagePrivacyHandler))
+	router.HandleFunc("/profile/privacy/lastseen", http.HandlerFunc(updateLastSeenPrivacyHandler))
 	router.HandleFunc("/profile/name/update", func(w http.ResponseWriter, r *http.Request) {
 		updateDisplayNameHandler(hub, w, r)
 	})
 	router.HandleFunc("/profile/displayname/update", http.HandlerFunc(updateUserDisplayNameHandler))
+	router.HandleFunc("/profile/username/update", func(w http.ResponseWriter, r *http.Request) {
+		updateUsernameHandler(hub, w, r)
+	}).Methods("POST")
+	router.HandleFunc("/profile/phone/update", http.HandlerFunc(updatePhoneHandler)).Methods("POST")
+	router.HandleFunc("/profile/contact-email/confirm", http.HandlerFunc(confirmContactEmailHandler)).Methods("POST")
+	router.HandleFunc("/profile/contact-email", http.HandlerFunc(deleteContactEmailHandler)).Methods("DELETE")
+	router.HandleFunc("/profiles/check-email", http.HandlerFunc(checkEmailAvailabilityHandler)).Methods("POST")
+	router.HandleFunc("/profiles/check-phone", http.HandlerFunc(checkPhoneAvailabilityHandler)).Methods("POST")
+	router.HandleFunc("/v1/auth/2fa/status", http.HandlerFunc(get2FAStatusHandler)).Methods("GET")
+	router.HandleFunc("/v1/auth/2fa/setup", http.HandlerFunc(setup2FAHandler)).Methods("POST")
+	router.HandleFunc("/v1/auth/2fa/verify", http.HandlerFunc(verify2FAHandler)).Methods("POST")
 
 	// Delete account endpoint
 	router.HandleFunc("/v1/user/account/delete", deleteAccountHandler(db)).Methods("DELETE", "OPTIONS")
@@ -4362,8 +5148,9 @@ func main() {
 		serveWs(hub,db, w, r)
 	})
 
-	log.Println("Server starting on :8080")
-	err = http.ListenAndServe("0.0.0.0:8080", corsMiddleware(router)) // Use the middleware here
+	port := getEnv("PORT", getEnv("SERVER_PORT", "8080"))
+	log.Printf("Server starting on :%s", port)
+	err = http.ListenAndServe("0.0.0.0:"+port, corsMiddleware(router)) // Use the middleware here
 	if err != nil {
  	    log.Fatal("ListenAndServe: ", err)
 	}
