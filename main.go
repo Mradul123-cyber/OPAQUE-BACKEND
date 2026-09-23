@@ -2296,6 +2296,126 @@ func getMyProfileHandler(db *sql.DB) http.HandlerFunc {
 	}
 }
 
+// getUserProfileHandler returns public profile info and friendship status for a given user UID or username.
+func getUserProfileHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		token, _, err := getVerifiedToken(r)
+		if err != nil {
+			handleAuthError(w, err)
+			return
+		}
+		currentUserUID := token.UID
+
+		vars := mux.Vars(r)
+		targetUID := vars["uid"]
+		if targetUID == "" {
+			targetUID = r.URL.Query().Get("uid")
+		}
+		targetUsername := r.URL.Query().Get("username")
+
+		if targetUID == "" && targetUsername == "" {
+			sendJSONError(w, http.StatusBadRequest, "invalid_params", "uid or username is required")
+			return
+		}
+
+		var uid string
+		var username string
+		var displayName sql.NullString
+		var profileAvatarURL sql.NullString
+		var phoneHash sql.NullString
+		var createdAt sql.NullTime
+		var isFriend bool
+		var hasSentRequest bool
+		var hasReceivedRequest bool
+		var identityKeyB64 sql.NullString
+
+		query := `
+			SELECT 
+				p.firebase_uid,
+				p.username,
+				p.display_name,
+				CASE 
+					WHEN p.avatar_privacy = 'nobody' THEN NULL
+					WHEN p.avatar_privacy = 'contacts' AND NOT EXISTS (
+						SELECT 1 FROM friendships f 
+						WHERE ((f.user_a_uid = p.firebase_uid AND f.user_b_uid = $1) OR (f.user_a_uid = $1 AND f.user_b_uid = p.firebase_uid))
+						  AND f.status = 'accepted'
+					) THEN NULL
+					ELSE p.profile_avatar_url 
+				END AS avatar_url,
+				p.phone_hash,
+				p.created_at,
+				EXISTS(
+					SELECT 1 FROM friendships f
+					WHERE ((f.user_a_uid = $1 AND f.user_b_uid = p.firebase_uid)
+						OR (f.user_b_uid = $1 AND f.user_a_uid = p.firebase_uid))
+					  AND f.status = 'accepted'
+				) AS is_friend,
+				EXISTS(
+					SELECT 1 FROM friendships f
+					WHERE f.user_a_uid = $1 AND f.user_b_uid = p.firebase_uid AND f.status = 'pending'
+				) AS has_sent_request,
+				EXISTS(
+					SELECT 1 FROM friendships f
+					WHERE f.user_a_uid = p.firebase_uid AND f.user_b_uid = $1 AND f.status = 'pending'
+				) AS has_received_request,
+				COALESCE(encode(ik.public_key, 'base64'), '') AS identity_key_b64
+			FROM profiles p
+			LEFT JOIN identity_keys ik ON ik.firebase_uid = p.firebase_uid
+			WHERE ($2 != '' AND p.firebase_uid = $2) OR ($3 != '' AND LOWER(p.username) = LOWER($3))
+			LIMIT 1
+		`
+
+		err = db.QueryRowContext(r.Context(), query, currentUserUID, targetUID, targetUsername).Scan(
+			&uid,
+			&username,
+			&displayName,
+			&profileAvatarURL,
+			&phoneHash,
+			&createdAt,
+			&isFriend,
+			&hasSentRequest,
+			&hasReceivedRequest,
+			&identityKeyB64,
+		)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				sendJSONError(w, http.StatusNotFound, "profile_not_found", "User profile not found")
+				return
+			}
+			log.Printf("getUserProfileHandler: DB error for %s: %v", targetUID, err)
+			sendJSONError(w, http.StatusInternalServerError, "server_error", "Failed to query profile")
+			return
+		}
+
+		response := map[string]interface{}{
+			"status":              "found",
+			"uid":                 uid,
+			"username":            username,
+			"display_name":        displayName.String,
+			"avatarUrl":           profileAvatarURL.String,
+			"profile_picture_url": profileAvatarURL.String,
+			"isFriend":            isFriend,
+			"hasSentRequest":      hasSentRequest,
+			"hasReceivedRequest":  hasReceivedRequest,
+		}
+		if identityKeyB64.Valid && identityKeyB64.String != "" {
+			response["identity_key_b64"] = identityKeyB64.String
+		}
+		if createdAt.Valid {
+			response["createdAt"] = createdAt.Time.Format(time.RFC3339)
+		}
+		if phoneHash.Valid && phoneHash.String != "" {
+			response["has_phone"] = true
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(response)
+	}
+}
+
+
 // confirmContactEmailHandler is called by the Flutter client after the user
 // has clicked the Firebase verification link.  It re-validates the token so we
 // can inspect the user's providerData server-side, then marks the email as
@@ -5024,6 +5144,8 @@ func main() {
 	router.HandleFunc("/v1/files/{fileId}", basicRateLimitMiddleware(downloadFileHandler))
 
 	router.HandleFunc("/profiles/me", getMyProfileHandler(db))
+	router.HandleFunc("/profiles/user/{uid}", getUserProfileHandler(db)).Methods("GET")
+	router.HandleFunc("/profiles/user", getUserProfileHandler(db)).Methods("GET")
 	router.HandleFunc("/profiles/check-username", RateLimitMiddleware(usernameCheckLimiter, "check-username")(checkUsernameAvailabilityHandler))
 	router.HandleFunc("/profiles/create", RateLimitMiddleware(profileCreateLimiter, "create-profile")(createProfileHandler))
 	router.HandleFunc("/profile/avatar/update", http.HandlerFunc(updateAvatarHandler))

@@ -47,7 +47,7 @@ func sendPushNotification(fcmToken string, title string, body string, data map[s
 }
 
 // Send new message notification to offline users
-func sendNewMessageNotification(recipientUID string, senderUID string, senderUsername string, messageContent string, conversationID int, messageID int, contentB64 string, senderDeviceID int, messageType string, isGroup bool) {
+func sendNewMessageNotification(recipientUID string, senderUID string, senderUsername string, messageContent string, conversationID int, messageID int, contentB64 string, senderDeviceID int, messageType string, isGroup bool, groupName string, senderAvatar string, groupAvatar string) {
 	if fcmClient == nil {
 		log.Printf("FCM client not initialized, skipping notification to %s", recipientUID)
 		return
@@ -85,6 +85,9 @@ func sendNewMessageNotification(recipientUID string, senderUID string, senderUse
 
 	// Prepare notification data
 	title := senderUsername
+	if isGroup && groupName != "" {
+		title = groupName
+	}
 	body := messageContent
 	if body == "" {
 		body = "You have a new message"
@@ -105,6 +108,9 @@ func sendNewMessageNotification(recipientUID string, senderUID string, senderUse
 		"sender_device_id": fmt.Sprintf("%d", senderDeviceID),
 		"msg_type":         messageType,
 		"is_group":         fmt.Sprintf("%t", isGroup),
+		"group_name":       groupName,
+		"sender_avatar":    senderAvatar,
+		"group_avatar":     groupAvatar,
 		"click_action":     "FLUTTER_NOTIFICATION_CLICK",
 	}
 

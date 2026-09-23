@@ -620,14 +620,14 @@ func sendMessageHandler(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 
 	// 1) Verify sender is a member of conversation and check announcement mode permissions
-	var userRole, sendMsgPerm sql.NullString
+	var userRole, sendMsgPerm, groupName, groupAvatarURL sql.NullString
 	var isGroup bool
 	err = tx.QueryRow(`
-		SELECT cm.role, COALESCE(c.send_messages_permission, 'all_members'), COALESCE(c.is_group, false)
+		SELECT cm.role, COALESCE(c.send_messages_permission, 'all_members'), COALESCE(c.is_group, false), c.group_name, c.group_avatar_url
 		FROM conversation_members cm
 		JOIN conversations c ON cm.conversation_id = c.id
 		WHERE cm.conversation_id = $1 AND cm.profile_uid = $2
-	`, req.ConversationID, senderUID).Scan(&userRole, &sendMsgPerm, &isGroup)
+	`, req.ConversationID, senderUID).Scan(&userRole, &sendMsgPerm, &isGroup, &groupName, &groupAvatarURL)
 	if err != nil {
 		log.Printf("sendMessageHandler: check membership error: %v", err)
 		http.Error(w, "not a member of conversation", http.StatusForbidden)
@@ -811,7 +811,8 @@ func sendMessageHandler(w http.ResponseWriter, r *http.Request) {
 		`, r.UID, senderUID, req.ConversationID, messageID, contentBytes, sessionContextBytes)
 
 		var senderDisplayName string
-		err = db.QueryRow(`SELECT username FROM profiles WHERE firebase_uid = $1`, senderUID).Scan(&senderDisplayName)
+		var senderAvatarURL sql.NullString
+		err = db.QueryRow(`SELECT username, profile_avatar_url FROM profiles WHERE firebase_uid = $1`, senderUID).Scan(&senderDisplayName, &senderAvatarURL)
 
 		if err != nil {
 			log.Printf("ERROR: offline queue insert failed for %s: %v", r.UID, err)
@@ -828,6 +829,15 @@ func sendMessageHandler(w http.ResponseWriter, r *http.Request) {
 					"sender_device_id": senderDeviceID,
 					"message_type":     coalesceString(req.MessageType, "chat"),
 					"is_group":         isGroup,
+				}
+				if isGroup && groupName.Valid && groupName.String != "" {
+					messageData["group_name"] = groupName.String
+				}
+				if senderAvatarURL.Valid && senderAvatarURL.String != "" {
+					messageData["sender_avatar"] = senderAvatarURL.String
+				}
+				if isGroup && groupAvatarURL.Valid && groupAvatarURL.String != "" {
+					messageData["group_avatar"] = groupAvatarURL.String
 				}
 				sendNewMessageNotificationFromMessage(r.UID, messageData)
 			}
@@ -881,9 +891,10 @@ if !isSenderOnline {
         storedTimestamp = time.Now().UTC()
     }
 
-    // Query if conversation is a group
+    // Query if conversation is a group and get group name
     var isGroup bool
-    err = db.QueryRow(`SELECT is_group FROM conversations WHERE id = $1`, convID).Scan(&isGroup)
+    var convGroupName sql.NullString
+    err = db.QueryRow(`SELECT COALESCE(is_group, false), group_name FROM conversations WHERE id = $1`, convID).Scan(&isGroup, &convGroupName)
     if err != nil {
         log.Printf("Failed to query is_group for conversation %d: %v", convID, err)
         isGroup = false
@@ -901,6 +912,9 @@ if !isSenderOnline {
         "content_b64":      contentB64,
         "created_at":       storedTimestamp.UTC().Format(time.RFC3339),
         "is_group":         isGroup,
+    }
+    if isGroup && convGroupName.Valid && convGroupName.String != "" {
+        wsMessage["group_name"] = convGroupName.String
     }
 //     log.Printf("DEBUG: wsMessage created with is_group: %v", wsMessage["is_group"])
 
@@ -1858,6 +1872,7 @@ func deliverOfflineMessages(client *Client) {
                ma.id as attachment_id,
                ma.file_type as attachment_type,
                c.is_group,
+               c.group_name,
                EXISTS(
                    SELECT 1 FROM offline_message_queue omq2
                    WHERE omq2.recipient_uid = $1
@@ -1898,12 +1913,13 @@ for rows.Next() {
     var attachmentID sql.NullInt64
     var attachmentType sql.NullString
     var isGroup bool
+    var offlineGroupName sql.NullString
     var hasDeletion bool
     var msgSenderDeviceID int
 
     err := rows.Scan(&queueID, &messageType, &messageData,
                     &messageID, &senderUID, &conversationID, &encryptedContent,
-                    &sessionContext, &createdAt, &senderUsername, &attachmentID, &attachmentType, &isGroup, &hasDeletion, &msgSenderDeviceID)
+                    &sessionContext, &createdAt, &senderUsername, &attachmentID, &attachmentType, &isGroup, &offlineGroupName, &hasDeletion, &msgSenderDeviceID)
     if err != nil {
         log.Printf("deliverOfflineMessages: scan error: %v", err)
         continue
@@ -1942,6 +1958,9 @@ for rows.Next() {
             "from_offline_queue": true,
             "message_type":       messageType.String,
             "is_group":           isGroup,
+        }
+        if isGroup && offlineGroupName.Valid && offlineGroupName.String != "" {
+            wsMessage["group_name"] = offlineGroupName.String
         }
 //         log.Printf("DEBUG Offline: Delivering message with is_group=%v for conversation %d", isGroup, int(conversationID.Int64))
 

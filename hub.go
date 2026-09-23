@@ -599,9 +599,12 @@ func sendNewMessageNotificationFromMessage(recipientUID string, message map[stri
 	}
 
 	isGroup, _ := message["is_group"].(bool)
+	groupName, _ := message["group_name"].(string)
+	senderAvatar, _ := message["sender_avatar"].(string)
+	groupAvatar, _ := message["group_avatar"].(string)
 	
 	// Send the push notification with full E2EE ciphertext and metadata
-	sendNewMessageNotification(recipientUID, senderUID, senderUsername, messageContent, conversationID, messageID, contentB64, senderDeviceID, messageType, isGroup)
+	sendNewMessageNotification(recipientUID, senderUID, senderUsername, messageContent, conversationID, messageID, contentB64, senderDeviceID, messageType, isGroup, groupName, senderAvatar, groupAvatar)
 }
 
 // Queue deletion notification for offline user
